@@ -46,10 +46,11 @@ def search_tickers():
         resp.raise_for_status()
         data = resp.json()
 
-        # Trim to US-listed common stocks, cap at 8 results, and shape the response
+        # Include common stocks AND ETFs/index funds, cap at 8 results
+        allowed_types = {"Common Stock", "ETF", "Exchange Traded Fund"}
         results = []
         for item in data.get("result", []):
-            if item.get("type") == "Common Stock" and "." not in item.get("symbol", ""):
+            if item.get("type") in allowed_types and "." not in item.get("symbol", ""):
                 results.append({
                     "symbol": item.get("symbol"),
                     "name": item.get("description"),

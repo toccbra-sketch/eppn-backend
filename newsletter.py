@@ -63,7 +63,7 @@ def get_stock_snapshot(ticker):
                 "to": today.isoformat(),
                 "token": FINNHUB_API_KEY,
             },
-            timeout=10
+            timeout=50
         )
         if news_resp.ok:
             news_items = news_resp.json()

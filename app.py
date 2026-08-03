@@ -46,15 +46,23 @@ def search_tickers():
         resp.raise_for_status()
         data = resp.json()
 
-        # Include common stocks AND ETFs/index funds, cap at 8 results
-        allowed_types = {"Common Stock", "ETF", "Exchange Traded Fund"}
+        # Exclude a small blocklist of clearly irrelevant types, rather than
+        # requiring an exact match — Finnhub's type labels for ETFs/funds
+        # aren't consistently "ETF" across all results, so an allowlist was
+        # silently dropping valid index fund results.
+        blocked_types = {"Crypto", "Forex", "Index"}
         results = []
         for item in data.get("result", []):
-            if item.get("type") in allowed_types and "." not in item.get("symbol", ""):
-                results.append({
-                    "symbol": item.get("symbol"),
-                    "name": item.get("description"),
-                })
+            symbol = item.get("symbol", "")
+            item_type = item.get("type", "")
+            if item_type in blocked_types:
+                continue
+            if "." in symbol:  # skip foreign-exchange-listed duplicates
+                continue
+            results.append({
+                "symbol": symbol,
+                "name": item.get("description"),
+            })
             if len(results) >= 8:
                 break
 

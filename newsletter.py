@@ -37,7 +37,7 @@ def get_stock_snapshot(ticker):
         quote_resp = requests.get(
             "https://finnhub.io/api/v1/quote",
             params={"symbol": ticker, "token": FINNHUB_API_KEY},
-            timeout=50
+            timeout=10
         )
         quote_resp.raise_for_status()
         quote = quote_resp.json()
@@ -63,7 +63,7 @@ def get_stock_snapshot(ticker):
                 "to": today.isoformat(),
                 "token": FINNHUB_API_KEY,
             },
-            timeout=50
+            timeout=10
         )
         if news_resp.ok:
             news_items = news_resp.json()
@@ -153,16 +153,13 @@ def build_email_html(name, stock_sections):
     """
 
 
-def send_email(to_email, subject, html_body):
+def send_email(server, to_email, subject, html_body):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = EMAIL_ADDRESS
     msg["To"] = to_email
     msg.attach(MIMEText(html_body, "html"))
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
-        server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
+    server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
 
 
 def main():
@@ -173,35 +170,41 @@ def main():
     # if multiple people hold the same stock.
     cache = {}
 
-    for sub in subscribers:
-        name = sub.get("Name", "there")
-        email = sub.get("Email")
-        portfolio = [t.strip().upper() for t in sub.get("Portfolio", "").split(",") if t.strip()]
+    # Open ONE SMTP connection and reuse it for every email, instead of
+    # reconnecting/logging in from scratch per subscriber (this was the main
+    # slowdown as subscriber count grows).
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
 
-        if not email or not portfolio:
-            continue
+        for sub in subscribers:
+            name = sub.get("Name", "there")
+            email = sub.get("Email")
+            portfolio = [t.strip().upper() for t in sub.get("Portfolio", "").split(",") if t.strip()]
 
-        stock_sections = []
-        for ticker in portfolio:
-            if ticker not in cache:
-                snapshot = get_stock_snapshot(ticker)
-                if snapshot:
-                    snapshot["blurb"] = generate_blurb(snapshot)
-                    cache[ticker] = snapshot
-                else:
-                    continue
-            stock_sections.append(cache[ticker])
+            if not email or not portfolio:
+                continue
 
-        if not stock_sections:
-            print(f"No valid stock data for {email}, skipping")
-            continue
+            stock_sections = []
+            for ticker in portfolio:
+                if ticker not in cache:
+                    snapshot = get_stock_snapshot(ticker)
+                    if snapshot:
+                        snapshot["blurb"] = generate_blurb(snapshot)
+                        cache[ticker] = snapshot
+                    else:
+                        continue
+                stock_sections.append(cache[ticker])
 
-        html = build_email_html(name, stock_sections)
-        try:
-            send_email(email, "Your daily portfolio update — EPPN", html)
-            print(f"Sent to {email}")
-        except Exception as e:
-            print(f"Failed to send to {email}: {e}")
+            if not stock_sections:
+                print(f"No valid stock data for {email}, skipping")
+                continue
+
+            html = build_email_html(name, stock_sections)
+            try:
+                send_email(server, email, "Your daily portfolio update — EPPN", html)
+                print(f"Sent to {email}")
+            except Exception as e:
+                print(f"Failed to send to {email}: {e}")
 
 
 if __name__ == "__main__":

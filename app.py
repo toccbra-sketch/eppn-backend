@@ -1,5 +1,6 @@
 import os
 import json
+import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import gspread
@@ -10,6 +11,7 @@ CORS(app)  # allows your GitHub Pages site to call this backend
 
 # --- Google Sheets setup ---
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+FINNHUB_API_KEY = os.environ["FINNHUB_API_KEY"]
 
 def get_sheet():
     # Credentials are stored as an environment variable on Render (see deployment steps)
@@ -26,6 +28,39 @@ def get_sheet():
 @app.route("/")
 def home():
     return "EPPN backend is running."
+
+
+@app.route("/search-tickers")
+def search_tickers():
+    """Proxies Finnhub's symbol search so the API key never reaches the browser."""
+    query = request.args.get("q", "").strip()
+    if not query or len(query) < 1:
+        return jsonify({"results": []})
+
+    try:
+        resp = requests.get(
+            "https://finnhub.io/api/v1/search",
+            params={"q": query, "token": FINNHUB_API_KEY},
+            timeout=10
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Trim to US-listed common stocks, cap at 8 results, and shape the response
+        results = []
+        for item in data.get("result", []):
+            if item.get("type") == "Common Stock" and "." not in item.get("symbol", ""):
+                results.append({
+                    "symbol": item.get("symbol"),
+                    "name": item.get("description"),
+                })
+            if len(results) >= 8:
+                break
+
+        return jsonify({"results": results})
+    except Exception as e:
+        print("Ticker search error:", e)
+        return jsonify({"results": [], "error": "Search failed"}), 500
 
 
 @app.route("/subscribe", methods=["POST"])

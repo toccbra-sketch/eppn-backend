@@ -232,9 +232,24 @@ def build_email_html(name, stock_sections):
         mistakes or inaccuracies. Always verify important details yourself before making any decisions
         about your portfolio.
       </p>
+      <p style="font-size:12px; color:#777;">
+        <strong>Data accuracy.</strong> Price and market data is provided by third-party sources and may
+        be delayed, incomplete, or occasionally inaccurate.
+      </p>
+      <p style="font-size:12px; color:#777;">
+        <strong>Past performance.</strong> Historical patterns referenced in this newsletter are not
+        indicative of future results.
+      </p>
+      <p style="font-size:12px; color:#777;">
+        <strong>No advisory relationship.</strong> EPPN is not a registered investment advisor and does
+        not act in a fiduciary capacity for subscribers.
+      </p>
       <p style="font-size:12px;">
         <a href="https://yourdomain.com/edit-portfolio">Edit portfolio</a> |
         <a href="https://yourdomain.com/unsubscribe">Unsubscribe</a>
+      </p>
+      <p style="font-size:11px; color:#aaa;">
+        [Your business mailing address here — required by the CAN-SPAM Act for commercial email]
       </p>
     </div>
     """

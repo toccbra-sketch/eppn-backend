@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -37,15 +38,29 @@ def search_tickers():
     if not query or len(query) < 1:
         return jsonify({"results": []})
 
-    try:
-        resp = requests.get(
-            "https://finnhub.io/api/v1/search",
-            params={"q": query, "token": FINNHUB_API_KEY},
-            timeout=10
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    data = None
+    last_error = None
+    for attempt in range(1, 3):  # try up to 2 times, since 502s are often transient
+        try:
+            resp = requests.get(
+                "https://finnhub.io/api/v1/search",
+                params={"q": query, "token": FINNHUB_API_KEY},
+                timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except Exception as e:
+            last_error = e
+            print(f"Ticker search attempt {attempt} failed: {e}")
+            if attempt < 2:
+                time.sleep(1)
 
+    if data is None:
+        print("Ticker search error (all attempts failed):", last_error)
+        return jsonify({"results": [], "error": "Search temporarily unavailable"}), 503
+
+    try:
         # Exclude a small blocklist of clearly irrelevant types, rather than
         # requiring an exact match — Finnhub's type labels for ETFs/funds
         # aren't consistently "ETF" across all results, so an allowlist was

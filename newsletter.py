@@ -6,12 +6,13 @@ from email.mime.multipart import MIMEMultipart
 
 import gspread
 from google.oauth2.service_account import Credentials
-import yfinance as yf
+import requests
 from google import genai
 
 # --- Config from environment variables (set as GitHub Actions secrets) ---
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+FINNHUB_API_KEY = os.environ["FINNHUB_API_KEY"]
 EMAIL_ADDRESS = os.environ["EMAIL_ADDRESS"]
 EMAIL_APP_PASSWORD = os.environ["EMAIL_APP_PASSWORD"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
@@ -31,25 +32,47 @@ def get_subscribers():
 
 
 def get_stock_snapshot(ticker):
-    """Pull basic price info + a recent headline for one ticker."""
+    """Pull current price + % change + a recent headline for one ticker via Finnhub."""
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.history(period="2d")
-        if len(info) < 2:
+        quote_resp = requests.get(
+            "https://finnhub.io/api/v1/quote",
+            params={"symbol": ticker, "token": FINNHUB_API_KEY},
+            timeout=10
+        )
+        quote_resp.raise_for_status()
+        quote = quote_resp.json()
+
+        current_price = quote.get("c")
+        prev_close = quote.get("pc")
+
+        if not current_price or not prev_close:
+            print(f"No price data returned for {ticker}")
             return None
 
-        prev_close = info["Close"].iloc[-2]
-        latest_close = info["Close"].iloc[-1]
-        pct_change = ((latest_close - prev_close) / prev_close) * 100
+        pct_change = ((current_price - prev_close) / prev_close) * 100
 
+        # Recent company news (last 3 days)
         headline = None
-        news = stock.news
-        if news:
-            headline = news[0].get("title")
+        from datetime import date, timedelta
+        today = date.today()
+        news_resp = requests.get(
+            "https://finnhub.io/api/v1/company-news",
+            params={
+                "symbol": ticker,
+                "from": (today - timedelta(days=3)).isoformat(),
+                "to": today.isoformat(),
+                "token": FINNHUB_API_KEY,
+            },
+            timeout=10
+        )
+        if news_resp.ok:
+            news_items = news_resp.json()
+            if news_items:
+                headline = news_items[0].get("headline")
 
         return {
             "ticker": ticker,
-            "price": round(latest_close, 2),
+            "price": round(current_price, 2),
             "pct_change": round(pct_change, 2),
             "headline": headline,
         }

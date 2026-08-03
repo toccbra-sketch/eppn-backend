@@ -1,0 +1,33 @@
+name: Send Daily Newsletter
+
+on:
+  schedule:
+    # Runs at 12:00 UTC every day — adjust to your preferred send time.
+    # (UTC 12:00 = 8:00 AM Eastern / 7:00 AM Michigan during daylight saving time)
+    - cron: '0 12 * * *'
+  workflow_dispatch: {}  # lets you manually trigger a run from the GitHub Actions tab, for testing
+
+jobs:
+  send-newsletter:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r newsletter_requirements.txt
+
+      - name: Run newsletter script
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SHEET_NAME: ${{ secrets.SHEET_NAME }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+        run: python newsletter.py

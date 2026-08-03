@@ -37,7 +37,7 @@ def get_stock_snapshot(ticker):
         quote_resp = requests.get(
             "https://finnhub.io/api/v1/quote",
             params={"symbol": ticker, "token": FINNHUB_API_KEY},
-            timeout=10
+            timeout=50
         )
         quote_resp.raise_for_status()
         quote = quote_resp.json()

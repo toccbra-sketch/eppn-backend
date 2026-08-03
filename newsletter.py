@@ -6,6 +6,7 @@ from email.mime.multipart import MIMEMultipart
 
 import gspread
 from google.oauth2.service_account import Credentials
+import time
 import requests
 from google import genai
 
@@ -31,54 +32,59 @@ def get_subscribers():
     return [r for r in rows if str(r.get("Status", "")).lower() == "active"]
 
 
-def get_stock_snapshot(ticker):
+def get_stock_snapshot(ticker, max_retries=3):
     """Pull current price + % change + a recent headline for one ticker via Finnhub."""
-    try:
-        quote_resp = requests.get(
-            "https://finnhub.io/api/v1/quote",
-            params={"symbol": ticker, "token": FINNHUB_API_KEY},
-            timeout=10
-        )
-        quote_resp.raise_for_status()
-        quote = quote_resp.json()
+    for attempt in range(1, max_retries + 1):
+        try:
+            quote_resp = requests.get(
+                "https://finnhub.io/api/v1/quote",
+                params={"symbol": ticker, "token": FINNHUB_API_KEY},
+                timeout=20
+            )
+            quote_resp.raise_for_status()
+            quote = quote_resp.json()
 
-        current_price = quote.get("c")
-        prev_close = quote.get("pc")
+            current_price = quote.get("c")
+            prev_close = quote.get("pc")
 
-        if not current_price or not prev_close:
-            print(f"No price data returned for {ticker}")
-            return None
+            if not current_price or not prev_close:
+                print(f"No price data returned for {ticker}")
+                return None
 
-        pct_change = ((current_price - prev_close) / prev_close) * 100
+            pct_change = ((current_price - prev_close) / prev_close) * 100
 
-        # Recent company news (last 3 days)
-        headline = None
-        from datetime import date, timedelta
-        today = date.today()
-        news_resp = requests.get(
-            "https://finnhub.io/api/v1/company-news",
-            params={
-                "symbol": ticker,
-                "from": (today - timedelta(days=3)).isoformat(),
-                "to": today.isoformat(),
-                "token": FINNHUB_API_KEY,
-            },
-            timeout=10
-        )
-        if news_resp.ok:
-            news_items = news_resp.json()
-            if news_items:
-                headline = news_items[0].get("headline")
+            # Recent company news (last 3 days)
+            headline = None
+            from datetime import date, timedelta
+            today = date.today()
+            news_resp = requests.get(
+                "https://finnhub.io/api/v1/company-news",
+                params={
+                    "symbol": ticker,
+                    "from": (today - timedelta(days=3)).isoformat(),
+                    "to": today.isoformat(),
+                    "token": FINNHUB_API_KEY,
+                },
+                timeout=20
+            )
+            if news_resp.ok:
+                news_items = news_resp.json()
+                if news_items:
+                    headline = news_items[0].get("headline")
 
-        return {
-            "ticker": ticker,
-            "price": round(current_price, 2),
-            "pct_change": round(pct_change, 2),
-            "headline": headline,
-        }
-    except Exception as e:
-        print(f"Could not fetch data for {ticker}: {e}")
-        return None
+            return {
+                "ticker": ticker,
+                "price": round(current_price, 2),
+                "pct_change": round(pct_change, 2),
+                "headline": headline,
+            }
+        except Exception as e:
+            print(f"Attempt {attempt}/{max_retries} failed for {ticker}: {e}")
+            if attempt < max_retries:
+                time.sleep(3 * attempt)  # brief backoff before retrying
+            else:
+                print(f"Giving up on {ticker} after {max_retries} attempts")
+                return None
 
 
 FORBIDDEN_PHRASES = [
@@ -110,11 +116,16 @@ STRICT RULES — these are non-negotiable:
 This is strictly educational content. If you cannot describe this news/movement without implying
 a course of action, focus purely on factual historical context instead."""
 
-    response = gemini_client.models.generate_content(
-        model="gemini-flash-latest",
-        contents=prompt
-    )
-    blurb = response.text.strip()
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-flash-latest",
+            contents=prompt
+        )
+        blurb = response.text.strip()
+    except Exception as e:
+        print(f"Gemini call failed for {snapshot['ticker']}: {e}")
+        return (f"{snapshot['ticker']} moved {snapshot['pct_change']}% today. "
+                f"(Trend note unavailable for this update.)")
 
     # Second layer of protection: flag (don't silently trust the model)
     lowered = blurb.lower()

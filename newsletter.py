@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -95,9 +96,11 @@ FORBIDDEN_PHRASES = [
 
 # Common broad-market index funds/ETFs — used to hint the model so it doesn't
 # talk about "earnings" or "the company" for something that isn't a single company.
+# Add any ETF/fund tickers from your own portfolio here if their write-ups look off.
 KNOWN_FUNDS = {
     "VOO", "SPY", "VTI", "QQQ", "IVV", "VXUS", "VEA", "VWO", "BND", "AGG",
     "ARKK", "DIA", "IWM", "SCHD", "VYM", "VUG", "VTV", "XLK", "XLF", "XLE",
+    "TQQQ", "UCYB", "SQQQ", "SOXL", "SOXS", "UPRO", "SPXL", "SPXS", "TMF", "TMV",
 }
 
 # Rotated through so consecutive blurbs don't all lean on the same opening
@@ -114,14 +117,27 @@ def generate_blurb(snapshot, variation_index=0):
     """Ask Claude for a catchy headline + short educational blurb. Never buy/sell language.
     Returns a dict: {"headline": ..., "body": ...}"""
     is_fund = snapshot['ticker'] in KNOWN_FUNDS
-    asset_type_note = (
-        "This ticker is a broad-market index fund or ETF, not a single company — "
-        "it holds many underlying stocks. Do NOT reference 'earnings reports' or "
-        "talk about it as if it were one company. Instead, discuss it in terms of "
-        "overall market/sector movement."
-        if is_fund else
-        "This ticker is an individual company's stock."
-    )
+    # Crypto/forex symbols on Finnhub use an exchange-prefixed format like
+    # "BINANCE:BTCUSDT" — the colon is a reliable signal it's not a stock/fund.
+    is_crypto = ":" in snapshot['ticker']
+
+    if is_crypto:
+        asset_type_note = (
+            "This ticker is a cryptocurrency, not a company or fund. Do NOT reference 'earnings reports,' "
+            "'shares,' or talk about it as if it were a company or index fund. Discuss it in terms of "
+            "crypto market trends, trading activity, or sentiment instead. Cryptocurrency markets trade "
+            "24/7 and tend to be more volatile than stocks — you can note this as general context if relevant."
+        )
+    elif is_fund:
+        asset_type_note = (
+            "This ticker is a broad-market index fund or ETF, not a single company — "
+            "it holds many underlying stocks. Do NOT reference 'earnings reports' or "
+            "talk about it as if it were one company. Instead, discuss it in terms of "
+            "overall market/sector movement."
+        )
+    else:
+        asset_type_note = "This ticker is an individual company's stock."
+
     style_hint = STYLE_HINTS[variation_index % len(STYLE_HINTS)]
 
     prompt = f"""You are writing content for an educational investing newsletter, covering one ticker.
@@ -194,9 +210,16 @@ Respond ONLY with valid JSON in this exact format, nothing else, no markdown cod
         print(f"Claude call/parse failed for {snapshot['ticker']}: {e}")
         return fallback
 
-    # Second layer of protection: flag (don't silently trust the model)
+    # Second layer of protection: flag (don't silently trust the model).
+    # Uses word-boundary matching, not raw substring matching — otherwise "hold"
+    # would false-positive on completely innocent words like "holds", "holdings",
+    # or "shareholders", which are normal, safe things to say about a fund.
     combined_lowered = (headline + " " + body).lower()
-    if any(phrase in combined_lowered for phrase in FORBIDDEN_PHRASES):
+    flagged = any(
+        re.search(r'\b' + re.escape(phrase) + r'\b', combined_lowered)
+        for phrase in FORBIDDEN_PHRASES
+    )
+    if flagged:
         print(f"WARNING: content for {snapshot['ticker']} contained flagged language, using fallback text")
         return {
             "headline": f"{snapshot['ticker']} Update",
@@ -213,11 +236,14 @@ def build_email_html(name, stock_sections):
         arrow = "▲" if s["pct_change"] >= 0 else "▼"
         headline = s["blurb"]["headline"]
         body = s["blurb"]["body"]
+        # Display-friendly ticker: strip exchange prefix for crypto (e.g.
+        # "BINANCE:BTCUSDT" shows as "BTCUSDT") so it doesn't look technical.
+        display_ticker = s['ticker'].split(":")[-1] if ":" in s['ticker'] else s['ticker']
         sections_html += f"""
         <div style="margin-bottom:20px; padding:14px; border:1px solid #ddd; border-radius:6px;">
           <h2 style="margin:0 0 4px; font-size:17px; color:#1a1a1a;">{headline}</h2>
           <div style="font-size:13px; color:#555; margin-bottom:8px; font-weight:bold;">
-            {s['ticker']} &nbsp;·&nbsp; ${s['price']} &nbsp;<span style="color:#555;">{arrow}</span> {abs(s['pct_change'])}%
+            {display_ticker} &nbsp;·&nbsp; ${s['price']} &nbsp;<span style="color:#555;">{arrow}</span> {abs(s['pct_change'])}%
           </div>
           <p style="margin:0; color:#333;">{body}</p>
         </div>
@@ -254,6 +280,11 @@ def build_email_html(name, stock_sections):
       <p style="font-size:12px; color:#777;">
         <strong>No advisory relationship.</strong> EPPN is not a registered investment advisor and does
         not act in a fiduciary capacity for subscribers.
+      </p>
+      <p style="font-size:12px; color:#777;">
+        Can't find a ticker, or does something look off — missing news, an unclear price, or
+        anything else that doesn't seem right? Email us at
+        <a href="mailto:YOUR_EMAIL_HERE@example.com">YOUR_EMAIL_HERE@example.com</a> and we'll look into adding it.
       </p>
       <p style="font-size:12px;">
         <a href="https://yourdomain.com/edit-portfolio">Edit portfolio</a> |

@@ -53,12 +53,37 @@ FALLBACK_TICKERS = [
 ]
 
 
+# Common cryptocurrencies, mapped to Finnhub's exchange-prefixed quote format.
+# Finnhub's general /search endpoint is built for stocks/ETFs and doesn't reliably
+# surface real crypto pairs (searching "BTC" there returns things like "Grayscale
+# Bitcoin Trust" — a stock, not actual Bitcoin) — so we match crypto separately here.
+POPULAR_CRYPTO = [
+    {"query_terms": ["btc", "bitcoin"], "symbol": "BINANCE:BTCUSDT", "name": "Bitcoin"},
+    {"query_terms": ["eth", "ethereum"], "symbol": "BINANCE:ETHUSDT", "name": "Ethereum"},
+    {"query_terms": ["sol", "solana"], "symbol": "BINANCE:SOLUSDT", "name": "Solana"},
+    {"query_terms": ["doge", "dogecoin"], "symbol": "BINANCE:DOGEUSDT", "name": "Dogecoin"},
+    {"query_terms": ["xrp", "ripple"], "symbol": "BINANCE:XRPUSDT", "name": "XRP"},
+    {"query_terms": ["ada", "cardano"], "symbol": "BINANCE:ADAUSDT", "name": "Cardano"},
+    {"query_terms": ["bnb", "binance coin"], "symbol": "BINANCE:BNBUSDT", "name": "BNB"},
+    {"query_terms": ["ltc", "litecoin"], "symbol": "BINANCE:LTCUSDT", "name": "Litecoin"},
+    {"query_terms": ["avax", "avalanche"], "symbol": "BINANCE:AVAXUSDT", "name": "Avalanche"},
+    {"query_terms": ["link", "chainlink"], "symbol": "BINANCE:LINKUSDT", "name": "Chainlink"},
+]
+
+
 @app.route("/search-tickers")
 def search_tickers():
     """Proxies Finnhub's symbol search so the API key never reaches the browser."""
     query = request.args.get("q", "").strip()
     if not query or len(query) < 1:
         return jsonify({"results": []})
+
+    q_lower = query.lower()
+    crypto_matches = [
+        {"symbol": c["symbol"], "name": c["name"]}
+        for c in POPULAR_CRYPTO
+        if any(q_lower in term or term.startswith(q_lower) for term in c["query_terms"])
+    ]
 
     data = None
     last_error = None
@@ -82,12 +107,12 @@ def search_tickers():
         # Live API is down — fall back to the small local list instead of
         # returning nothing, so the page still works for common tickers.
         print("Ticker search error (all attempts failed), using fallback list:", last_error)
-        q_lower = query.lower()
         fallback_matches = [
             t for t in FALLBACK_TICKERS
             if q_lower in t["symbol"].lower() or q_lower in t["name"].lower()
-        ][:8]
-        return jsonify({"results": fallback_matches, "fallback": True})
+        ]
+        combined = crypto_matches + fallback_matches
+        return jsonify({"results": combined[:8], "fallback": True})
 
     try:
         # Exclude a small blocklist of clearly irrelevant types, rather than
@@ -95,7 +120,7 @@ def search_tickers():
         # aren't consistently "ETF" across all results, so an allowlist was
         # silently dropping valid index fund results.
         blocked_types = {"Forex", "Index"}
-        results = []
+        results = list(crypto_matches)  # crypto matches shown first, if any
         for item in data.get("result", []):
             symbol = item.get("symbol", "")
             item_type = item.get("type", "")

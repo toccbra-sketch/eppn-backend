@@ -8,18 +8,18 @@ import gspread
 from google.oauth2.service_account import Credentials
 import time
 import requests
-from google import genai
+import anthropic
 
 # --- Config from environment variables (set as GitHub Actions secrets) ---
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 FINNHUB_API_KEY = os.environ["FINNHUB_API_KEY"]
 EMAIL_ADDRESS = os.environ["EMAIL_ADDRESS"]
 EMAIL_APP_PASSWORD = os.environ["EMAIL_APP_PASSWORD"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 SHEET_NAME = os.environ.get("SHEET_NAME", "Subscribers")
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
 def get_subscribers():
@@ -111,7 +111,7 @@ STYLE_HINTS = [
 
 
 def generate_blurb(snapshot, variation_index=0):
-    """Ask Gemini for a catchy headline + short educational blurb. Never buy/sell language.
+    """Ask Claude for a catchy headline + short educational blurb. Never buy/sell language.
     Returns a dict: {"headline": ..., "body": ...}"""
     is_fund = snapshot['ticker'] in KNOWN_FUNDS
     asset_type_note = (
@@ -138,7 +138,17 @@ Produce TWO things:
    (e.g. for a rocket company having a good day: "SpaceX Shoots for the Moon").
    The headline must NOT imply the reader should buy, sell, or take any action.
 2. A brief, neutral, educational paragraph (2-3 sentences) about what historically tends to follow
-   this kind of move or news, in plain, beginner-friendly language.
+   this kind of move or news.
+
+READABILITY — this is written for everyday personal investors, not finance professionals. Follow these
+rules strictly:
+- Use short, simple sentences. One idea per sentence.
+- Avoid financial jargon (e.g. don't say "volatility," "momentum," "valuation multiples," "market cap
+  compression" — say things like "the price swung a lot" or "investors reacted quickly" instead).
+- If a technical term is genuinely necessary, briefly explain it in plain words right there.
+- Write like you're explaining it to a smart friend who doesn't follow the stock market closely —
+  clear and conversational, not textbook or press-release toned.
+- Prefer concrete, everyday comparisons over abstract financial concepts.
 
 STYLE for the paragraph: {style_hint} Avoid starting with the word "Historically" — vary sentence openings
 and structure so this doesn't read like a template repeated for every stock. Keep the actual information
@@ -161,11 +171,12 @@ Respond ONLY with valid JSON in this exact format, nothing else, no markdown cod
     }
 
     try:
-        response = gemini_client.models.generate_content(
-            model="gemini-flash-latest",
-            contents=prompt
+        response = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
         )
-        raw = response.text.strip()
+        raw = response.content[0].text.strip()
         # Strip markdown code fences if the model added them anyway
         if raw.startswith("```"):
             raw = raw.strip("`")
@@ -180,7 +191,7 @@ Respond ONLY with valid JSON in this exact format, nothing else, no markdown cod
             raise ValueError("Missing headline or body in response")
 
     except Exception as e:
-        print(f"Gemini call/parse failed for {snapshot['ticker']}: {e}")
+        print(f"Claude call/parse failed for {snapshot['ticker']}: {e}")
         return fallback
 
     # Second layer of protection: flag (don't silently trust the model)

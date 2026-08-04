@@ -31,6 +31,28 @@ def home():
     return "EPPN backend is running."
 
 
+# Small local fallback so search still works (for common names) if Finnhub's
+# search endpoint is temporarily down — this is NOT a replacement for the live
+# API, just a safety net so the page doesn't look broken during an outage.
+FALLBACK_TICKERS = [
+    {"symbol": "AAPL", "name": "Apple Inc"},
+    {"symbol": "MSFT", "name": "Microsoft Corp"},
+    {"symbol": "GOOGL", "name": "Alphabet Inc"},
+    {"symbol": "AMZN", "name": "Amazon.com Inc"},
+    {"symbol": "TSLA", "name": "Tesla Inc"},
+    {"symbol": "NVDA", "name": "NVIDIA Corp"},
+    {"symbol": "META", "name": "Meta Platforms Inc"},
+    {"symbol": "NFLX", "name": "Netflix Inc"},
+    {"symbol": "DIS", "name": "Walt Disney Co"},
+    {"symbol": "IBM", "name": "IBM Corp"},
+    {"symbol": "AMD", "name": "Advanced Micro Devices"},
+    {"symbol": "VOO", "name": "Vanguard S&P 500 ETF"},
+    {"symbol": "SPY", "name": "SPDR S&P 500 ETF Trust"},
+    {"symbol": "QQQ", "name": "Invesco QQQ Trust"},
+    {"symbol": "VTI", "name": "Vanguard Total Stock Market ETF"},
+]
+
+
 @app.route("/search-tickers")
 def search_tickers():
     """Proxies Finnhub's symbol search so the API key never reaches the browser."""
@@ -40,7 +62,7 @@ def search_tickers():
 
     data = None
     last_error = None
-    for attempt in range(1, 3):  # try up to 2 times, since 502s are often transient
+    for attempt in range(1, 3):  # try up to 2 times, since 502s/503s are often transient
         try:
             resp = requests.get(
                 "https://finnhub.io/api/v1/search",
@@ -57,15 +79,22 @@ def search_tickers():
                 time.sleep(1)
 
     if data is None:
-        print("Ticker search error (all attempts failed):", last_error)
-        return jsonify({"results": [], "error": "Search temporarily unavailable"}), 503
+        # Live API is down — fall back to the small local list instead of
+        # returning nothing, so the page still works for common tickers.
+        print("Ticker search error (all attempts failed), using fallback list:", last_error)
+        q_lower = query.lower()
+        fallback_matches = [
+            t for t in FALLBACK_TICKERS
+            if q_lower in t["symbol"].lower() or q_lower in t["name"].lower()
+        ][:8]
+        return jsonify({"results": fallback_matches, "fallback": True})
 
     try:
         # Exclude a small blocklist of clearly irrelevant types, rather than
         # requiring an exact match — Finnhub's type labels for ETFs/funds
         # aren't consistently "ETF" across all results, so an allowlist was
         # silently dropping valid index fund results.
-        blocked_types = {"Crypto", "Forex", "Index"}
+        blocked_types = {"Forex", "Index"}
         results = []
         for item in data.get("result", []):
             symbol = item.get("symbol", "")

@@ -264,7 +264,35 @@ def send_email(server, to_email, subject, html_body):
     server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
 
 
+def is_trading_day():
+    """Checks Finnhub's market-status endpoint to see if today is a US market
+    holiday. We check this instead of just 'is the market open right now',
+    since the script runs before market open (8am) — 'open' would always be
+    false at that hour even on a normal trading day."""
+    try:
+        resp = requests.get(
+            "https://finnhub.io/api/v1/stock/market-status",
+            params={"exchange": "US", "token": FINNHUB_API_KEY},
+            timeout=10
+        )
+        resp.raise_for_status()
+        status = resp.json()
+        holiday_name = status.get("holiday")
+        if holiday_name:
+            print(f"Market holiday today ({holiday_name}) — skipping send.")
+            return False
+        return True
+    except Exception as e:
+        # If the check itself fails, default to sending rather than silently
+        # skipping a real trading day due to an unrelated API hiccup.
+        print(f"Could not check market holiday status, proceeding anyway: {e}")
+        return True
+
+
 def main():
+    if not is_trading_day():
+        return
+
     subscribers = get_subscribers()
     print(f"Found {len(subscribers)} active subscribers")
 

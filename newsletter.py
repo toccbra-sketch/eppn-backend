@@ -89,10 +89,23 @@ def get_stock_snapshot(ticker, max_retries=3):
 
 
 FORBIDDEN_PHRASES = [
-    "buy", "sell", "should invest", "you should", "i recommend", "recommendation",
-    "good time to", "bad time to", "consider buying", "consider selling",
-    "strong buy", "strong sell", "hold", "invest now", "worth investing",
+    # Direct second-person directives — the clearest signal of actual advice
+    "you should buy", "you should sell", "you should hold",
+    "you might buy", "you might sell", "you might want to buy", "you might want to sell",
+    "you could buy", "you could sell",
+    "consider buying", "consider selling", "consider holding",
+    # Explicit recommendation language
+    "should invest", "i recommend", "we recommend", "recommendation is",
+    "good time to buy", "good time to sell", "bad time to buy", "bad time to sell",
+    "strong buy", "strong sell", "buy now", "sell now",
+    "invest now", "worth investing", "worth buying", "worth selling",
 ]
+# Note: bare words like "buy," "sell," and "hold" are intentionally NOT in this
+# list on their own — they show up constantly in legitimate historical/descriptive
+# writing (e.g. "investors continued to buy shares after the earnings beat"),
+# which isn't advice. Blocking the bare words caused valid content to get
+# discarded inconsistently. The phrases above catch actual directive language
+# instead of penalizing normal market vocabulary.
 
 # Common broad-market index funds/ETFs — used to hint the model so it doesn't
 # talk about "earnings" or "the company" for something that isn't a single company.

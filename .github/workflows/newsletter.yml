@@ -2,9 +2,11 @@ name: Send Daily Newsletter
 
 on:
   schedule:
-    # Runs at 12:00 UTC every day — adjust to your preferred send time.
-    # (UTC 12:00 = 8:00 AM Eastern / 7:00 AM Michigan during daylight saving time)
-    - cron: '0 12 * * *'
+    # Runs at 12:00 UTC, Monday through Friday only
+    # (UTC 12:00 = 8:00 AM Eastern during daylight saving time, 7:00 AM Eastern in winter)
+    # Actual US market holidays (Thanksgiving, Christmas, etc.) are still filtered
+    # out inside newsletter.py itself, since cron has no concept of holidays.
+    - cron: '0 12 * * 1-5'
   workflow_dispatch: {}  # lets you manually trigger a run from the GitHub Actions tab, for testing
 
 jobs:

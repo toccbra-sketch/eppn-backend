@@ -1,4 +1,4 @@
 gspread==6.1.2
 google-auth==2.32.0
 requests==2.32.3
-anthropic==0.34.2
+anthropic

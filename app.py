@@ -2,10 +2,6 @@ import os
 import json
 import time
 import random
-import socket
-import ssl
-import smtplib
-from email.mime.text import MIMEText
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -18,24 +14,15 @@ CORS(app)  # allows your GitHub Pages site to call this backend
 # --- Google Sheets setup ---
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 FINNHUB_API_KEY = os.environ["FINNHUB_API_KEY"]
-EMAIL_ADDRESS = os.environ["EMAIL_ADDRESS"]
-EMAIL_APP_PASSWORD = os.environ["EMAIL_APP_PASSWORD"]
 
+# --- Brevo (email API) setup ---
+# We send email via Brevo's HTTPS API instead of raw SMTP because Render's free
+# tier blocks outbound traffic on SMTP ports (25/465/587) — HTTPS on port 443
+# isn't affected, so this works on the free plan.
+BREVO_API_KEY = os.environ["BREVO_API_KEY"]
+EMAIL_ADDRESS = os.environ["EMAIL_ADDRESS"]  # must be a verified sender in Brevo
+SENDER_NAME = os.environ.get("SENDER_NAME", "The Portfolio Briefcase")
 
-class SMTP_SSL_IPv4(smtplib.SMTP_SSL):
-    """Same as smtplib.SMTP_SSL, but forces the underlying socket to connect
-    over IPv4. Render's network doesn't support outbound IPv6, but Gmail's
-    SMTP hostname resolves to both an IPv4 and IPv6 address — if smtplib picks
-    the IPv6 one, the connection fails immediately with
-    'OSError: Network is unreachable'. We still pass the real hostname to SSL
-    (server_hostname=host) so Gmail's certificate still validates correctly;
-    only the raw socket connection is pinned to an IPv4 address."""
-    def _get_socket(self, host, port, timeout):
-        if timeout is not None and not timeout:
-            raise ValueError('Non-blocking socket (timeout=0) is not supported')
-        ipv4_addr = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
-        raw_socket = socket.create_connection((ipv4_addr, port), timeout, self.source_address)
-        return self.context.wrap_socket(raw_socket, server_hostname=host)
 
 def get_sheet():
     # Credentials are stored as an environment variable on Render (see deployment steps)
@@ -61,19 +48,26 @@ def find_subscriber_row(email):
 
 
 def send_plain_email(to_email, subject, body_text):
-    msg = MIMEText(body_text)
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_ADDRESS
-    msg["To"] = to_email
-    print(f"[send_plain_email] connecting to smtp.gmail.com for {to_email}...")
-    # timeout=10 so a stuck connection raises a clear TimeoutError instead of
-    # hanging until gunicorn's worker timeout kills the whole request silently
-    with SMTP_SSL_IPv4("smtp.gmail.com", 465, timeout=10) as server:
-        print(f"[send_plain_email] connected, logging in...")
-        server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
-        print(f"[send_plain_email] logged in, sending...")
-        server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
-        print(f"[send_plain_email] sent to {to_email}")
+    print(f"[send_plain_email] sending via Brevo API to {to_email}...")
+    resp = requests.post(
+        "https://api.brevo.com/v3/smtp/email",
+        headers={
+            "api-key": BREVO_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        json={
+            "sender": {"name": SENDER_NAME, "email": EMAIL_ADDRESS},
+            "to": [{"email": to_email}],
+            "subject": subject,
+            "textContent": body_text,
+        },
+        timeout=15,
+    )
+    if resp.status_code >= 300:
+        print(f"[send_plain_email] Brevo API error {resp.status_code}: {resp.text}")
+        resp.raise_for_status()
+    print(f"[send_plain_email] sent to {to_email} (Brevo message id: {resp.json().get('messageId')})")
 
 
 # In-memory store of pending login codes: { email: {"code": "123456", "expires": epoch_seconds} }

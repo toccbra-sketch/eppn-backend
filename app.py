@@ -2,6 +2,8 @@ import os
 import json
 import time
 import random
+import socket
+import ssl
 import smtplib
 from email.mime.text import MIMEText
 import requests
@@ -18,6 +20,22 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 FINNHUB_API_KEY = os.environ["FINNHUB_API_KEY"]
 EMAIL_ADDRESS = os.environ["EMAIL_ADDRESS"]
 EMAIL_APP_PASSWORD = os.environ["EMAIL_APP_PASSWORD"]
+
+
+class SMTP_SSL_IPv4(smtplib.SMTP_SSL):
+    """Same as smtplib.SMTP_SSL, but forces the underlying socket to connect
+    over IPv4. Render's network doesn't support outbound IPv6, but Gmail's
+    SMTP hostname resolves to both an IPv4 and IPv6 address — if smtplib picks
+    the IPv6 one, the connection fails immediately with
+    'OSError: Network is unreachable'. We still pass the real hostname to SSL
+    (server_hostname=host) so Gmail's certificate still validates correctly;
+    only the raw socket connection is pinned to an IPv4 address."""
+    def _get_socket(self, host, port, timeout):
+        if timeout is not None and not timeout:
+            raise ValueError('Non-blocking socket (timeout=0) is not supported')
+        ipv4_addr = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
+        raw_socket = socket.create_connection((ipv4_addr, port), timeout, self.source_address)
+        return self.context.wrap_socket(raw_socket, server_hostname=host)
 
 def get_sheet():
     # Credentials are stored as an environment variable on Render (see deployment steps)
@@ -50,7 +68,7 @@ def send_plain_email(to_email, subject, body_text):
     print(f"[send_plain_email] connecting to smtp.gmail.com for {to_email}...")
     # timeout=10 so a stuck connection raises a clear TimeoutError instead of
     # hanging until gunicorn's worker timeout kills the whole request silently
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
+    with SMTP_SSL_IPv4("smtp.gmail.com", 465, timeout=10) as server:
         print(f"[send_plain_email] connected, logging in...")
         server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
         print(f"[send_plain_email] logged in, sending...")

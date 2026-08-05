@@ -47,9 +47,15 @@ def send_plain_email(to_email, subject, body_text):
     msg["Subject"] = subject
     msg["From"] = EMAIL_ADDRESS
     msg["To"] = to_email
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+    print(f"[send_plain_email] connecting to smtp.gmail.com for {to_email}...")
+    # timeout=10 so a stuck connection raises a clear TimeoutError instead of
+    # hanging until gunicorn's worker timeout kills the whole request silently
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
+        print(f"[send_plain_email] connected, logging in...")
         server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+        print(f"[send_plain_email] logged in, sending...")
         server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
+        print(f"[send_plain_email] sent to {to_email}")
 
 
 # In-memory store of pending login codes: { email: {"code": "123456", "expires": epoch_seconds} }
@@ -266,7 +272,9 @@ def login_request():
     })
 
     try:
+        print(f"[login_request] looking up {email} in sheet...")
         _, record = find_subscriber_row(email)
+        print(f"[login_request] sheet lookup done")
         if not record or str(record.get("Status", "")).lower() != "active":
             return generic_response, 200  # don't reveal whether the email exists
 
@@ -282,9 +290,10 @@ def login_request():
             f"Your login code is: {code}\n\nThis code expires in 10 minutes. "
             f"If you didn't request this, you can safely ignore this email."
         )
+        print(f"[login_request] done for {email}")
 
     except Exception as e:
-        print("Login request error:", e)
+        print("Login request error:", repr(e))
         # Still return the generic message — don't leak internal errors to the client
 
     return generic_response, 200

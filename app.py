@@ -1,6 +1,9 @@
 import os
 import json
 import time
+import random
+import smtplib
+from email.mime.text import MIMEText
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -13,6 +16,8 @@ CORS(app)  # allows your GitHub Pages site to call this backend
 # --- Google Sheets setup ---
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 FINNHUB_API_KEY = os.environ["FINNHUB_API_KEY"]
+EMAIL_ADDRESS = os.environ["EMAIL_ADDRESS"]
+EMAIL_APP_PASSWORD = os.environ["EMAIL_APP_PASSWORD"]
 
 def get_sheet():
     # Credentials are stored as an environment variable on Render (see deployment steps)
@@ -24,6 +29,35 @@ def get_sheet():
     spreadsheet_id = os.environ["SPREADSHEET_ID"]
     sheet_name = os.environ.get("SHEET_NAME", "Subscribers")
     return client.open_by_key(spreadsheet_id).worksheet(sheet_name)
+
+
+def find_subscriber_row(email):
+    """Returns (row_number, row_dict) for a subscriber by email, or (None, None)."""
+    sheet = get_sheet()
+    records = sheet.get_all_records()
+    email_lower = email.strip().lower()
+    for i, record in enumerate(records, start=2):  # row 1 is headers
+        if str(record.get("Email", "")).strip().lower() == email_lower:
+            return i, record
+    return None, None
+
+
+def send_plain_email(to_email, subject, body_text):
+    msg = MIMEText(body_text)
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_ADDRESS
+    msg["To"] = to_email
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+        server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
+
+
+# In-memory store of pending login codes: { email: {"code": "123456", "expires": epoch_seconds} }
+# NOTE: this resets if the Render service restarts/spins down — acceptable for
+# short-lived codes (10 min expiry), just means a user would need to request a
+# fresh code in the rare case that happens mid-login.
+LOGIN_CODES = {}
+CODE_EXPIRY_SECONDS = 10 * 60
 
 
 @app.route("/")
@@ -69,6 +103,58 @@ POPULAR_CRYPTO = [
     {"query_terms": ["avax", "avalanche"], "symbol": "BINANCE:AVAXUSDT", "name": "Avalanche"},
     {"query_terms": ["link", "chainlink"], "symbol": "BINANCE:LINKUSDT", "name": "Chainlink"},
 ]
+
+
+def get_quote(ticker):
+    """Fetches just price + % change for one ticker (no news/AI) — used to show
+    live prices on the logged-in dashboard. Returns None on any failure so the
+    dashboard can show a ticker as 'price unavailable' rather than break."""
+    try:
+        resp = requests.get(
+            "https://finnhub.io/api/v1/quote",
+            params={"symbol": ticker, "token": FINNHUB_API_KEY},
+            timeout=10
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        current_price = data.get("c")
+        prev_close = data.get("pc")
+        if not current_price or not prev_close:
+            return None
+        pct_change = ((current_price - prev_close) / prev_close) * 100
+        return {"price": round(current_price, 2), "pct_change": round(pct_change, 2)}
+    except Exception as e:
+        print(f"Quote fetch failed for {ticker}: {e}")
+        return None
+
+
+@app.route("/portfolio-quotes")
+def portfolio_quotes():
+    """Returns the subscriber's name plus a live price + % change for each
+    ticker in their portfolio. Used by the logged-in home dashboard."""
+    email = request.args.get("email", "").strip()
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+
+    try:
+        _, record = find_subscriber_row(email)
+        if not record or str(record.get("Status", "")).lower() != "active":
+            return jsonify({"error": "No active subscriber found for this email"}), 404
+
+        tickers = [t.strip() for t in (record.get("Portfolio", "") or "").split(",") if t.strip()]
+        quotes = []
+        for ticker in tickers:
+            q = get_quote(ticker)
+            quotes.append({
+                "ticker": ticker,
+                "price": q["price"] if q else None,
+                "pct_change": q["pct_change"] if q else None,
+            })
+
+        return jsonify({"name": record.get("Name", ""), "quotes": quotes})
+    except Exception as e:
+        print("Portfolio quotes error:", e)
+        return jsonify({"error": "Could not retrieve live quotes"}), 500
 
 
 @app.route("/search-tickers")
@@ -161,6 +247,144 @@ def subscribe():
         return jsonify({"error": "Could not save subscriber"}), 500
 
     return jsonify({"message": "Subscribed successfully"}), 200
+
+
+@app.route("/login-request", methods=["POST"])
+def login_request():
+    """Step 1: person enters their email, we email them a 6-digit code (if that
+    email belongs to an active subscriber). Always returns a generic success
+    message either way, so this endpoint can't be used to check which emails
+    are subscribed."""
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip()
+
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+
+    generic_response = jsonify({
+        "message": "If that email is subscribed, a login code has been sent."
+    })
+
+    try:
+        _, record = find_subscriber_row(email)
+        if not record or str(record.get("Status", "")).lower() != "active":
+            return generic_response, 200  # don't reveal whether the email exists
+
+        code = f"{random.randint(0, 999999):06d}"
+        LOGIN_CODES[email.lower()] = {
+            "code": code,
+            "expires": time.time() + CODE_EXPIRY_SECONDS,
+        }
+
+        send_plain_email(
+            email,
+            "Your login code — The Portfolio Briefcase",
+            f"Your login code is: {code}\n\nThis code expires in 10 minutes. "
+            f"If you didn't request this, you can safely ignore this email."
+        )
+
+    except Exception as e:
+        print("Login request error:", e)
+        # Still return the generic message — don't leak internal errors to the client
+
+    return generic_response, 200
+
+
+@app.route("/login-verify", methods=["POST"])
+def login_verify():
+    """Step 2: person enters the code they received. If it matches and hasn't
+    expired, they're considered logged in (frontend stores the email locally)."""
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip().lower()
+    code = (data.get("code") or "").strip()
+
+    entry = LOGIN_CODES.get(email)
+    if not entry:
+        return jsonify({"error": "No pending code for this email. Request a new one."}), 400
+
+    if time.time() > entry["expires"]:
+        del LOGIN_CODES[email]
+        return jsonify({"error": "Code expired. Request a new one."}), 400
+
+    if code != entry["code"]:
+        return jsonify({"error": "Incorrect code."}), 400
+
+    del LOGIN_CODES[email]  # one-time use
+    return jsonify({"message": "Logged in successfully"}), 200
+
+
+@app.route("/get-portfolio")
+def get_portfolio():
+    """Returns a subscriber's current name/portfolio/status by email."""
+    email = request.args.get("email", "").strip()
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+
+    try:
+        _, record = find_subscriber_row(email)
+        if not record:
+            return jsonify({"error": "No subscriber found for this email"}), 404
+
+        return jsonify({
+            "name": record.get("Name", ""),
+            "email": record.get("Email", ""),
+            "portfolio": record.get("Portfolio", ""),
+            "status": record.get("Status", ""),
+        })
+    except Exception as e:
+        print("Get portfolio error:", e)
+        return jsonify({"error": "Could not retrieve portfolio"}), 500
+
+
+@app.route("/update-portfolio", methods=["POST"])
+def update_portfolio():
+    """Overwrites a subscriber's portfolio column."""
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip()
+    portfolio = (data.get("portfolio") or "").strip()
+
+    if not email or not portfolio:
+        return jsonify({"error": "Email and portfolio are required"}), 400
+
+    try:
+        sheet = get_sheet()
+        row_num, record = find_subscriber_row(email)
+        if not row_num:
+            return jsonify({"error": "No subscriber found for this email"}), 404
+
+        headers = sheet.row_values(1)
+        portfolio_col = headers.index("Portfolio") + 1  # gspread columns are 1-indexed
+        sheet.update_cell(row_num, portfolio_col, portfolio)
+
+        return jsonify({"message": "Portfolio updated successfully"}), 200
+    except Exception as e:
+        print("Update portfolio error:", e)
+        return jsonify({"error": "Could not update portfolio"}), 500
+
+
+@app.route("/unsubscribe", methods=["POST"])
+def unsubscribe():
+    """Sets a subscriber's status to inactive."""
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip()
+
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+
+    try:
+        sheet = get_sheet()
+        row_num, record = find_subscriber_row(email)
+        if not row_num:
+            return jsonify({"error": "No subscriber found for this email"}), 404
+
+        headers = sheet.row_values(1)
+        status_col = headers.index("Status") + 1
+        sheet.update_cell(row_num, status_col, "inactive")
+
+        return jsonify({"message": "Unsubscribed successfully"}), 200
+    except Exception as e:
+        print("Unsubscribe error:", e)
+        return jsonify({"error": "Could not unsubscribe"}), 500
 
 
 if __name__ == "__main__":

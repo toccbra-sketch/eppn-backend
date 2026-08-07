@@ -42,6 +42,6 @@ jobs:
           SHEET_NAME: ${{ secrets.SHEET_NAME }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
           EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
-          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
         run: python newsletter.py

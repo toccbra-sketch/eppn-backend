@@ -271,6 +271,10 @@ Produce TWO things:
       last resort, not the default.
    Never predict which way the price will move because of any of the above. State facts and known
    dates, not forecasts.
+   IMPORTANT: If there is NO upcoming earnings date and NO upcoming macro event, do not mention
+   that fact at all — never write things like "no earnings are scheduled this week" or "X doesn't
+   report until next quarter." Absence of an event is not itself newsworthy; it's just filler.
+   Simply skip straight to (c) or (d) as if earnings/macro events were never brought up.
 
 READABILITY — this is written for everyday personal investors, not finance professionals. Follow these
 rules strictly:

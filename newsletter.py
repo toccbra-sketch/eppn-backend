@@ -306,8 +306,7 @@ STRICT RULES — these are non-negotiable, for BOTH the headline and paragraph:
   genuinely there.
 - Do not add a disclaimer sentence — one is added separately in the email template.
 
-Respond ONLY with valid JSON in this exact format, nothing else, no markdown code fences:
-{{"headline": "your headline here", "body": "your paragraph here"}}"""
+Call the submit_blurb tool with your headline and body."""
 
     fallback = {
         "headline": f"{snapshot['ticker']} Update",
@@ -319,18 +318,37 @@ Respond ONLY with valid JSON in this exact format, nothing else, no markdown cod
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=300,
+            tools=[{
+                "name": "submit_blurb",
+                "description": "Submit the generated headline and body for this ticker.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "headline": {
+                            "type": "string",
+                            "description": "Short punny headline, max 8 words.",
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "2-3 sentence paragraph following the priority order and rules above.",
+                        },
+                    },
+                    "required": ["headline", "body"],
+                },
+            }],
+            tool_choice={"type": "tool", "name": "submit_blurb"},
             messages=[{"role": "user", "content": prompt}]
         )
-        raw = response.content[0].text.strip()
-        # Strip markdown code fences if the model added them anyway
-        if raw.startswith("```"):
-            raw = raw.strip("`")
-            if raw.lower().startswith("json"):
-                raw = raw[4:].strip()
 
-        parsed = json.loads(raw)
-        headline = str(parsed.get("headline", "")).strip()
-        body = str(parsed.get("body", "")).strip()
+        tool_use_block = next(
+            (block for block in response.content if block.type == "tool_use"),
+            None
+        )
+        if not tool_use_block:
+            raise ValueError("No tool_use block in response")
+
+        headline = str(tool_use_block.input.get("headline", "")).strip()
+        body = str(tool_use_block.input.get("body", "")).strip()
 
         if not headline or not body:
             raise ValueError("Missing headline or body in response")

@@ -2,6 +2,7 @@ import os
 import json
 import time
 import random
+import secrets
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -77,6 +78,36 @@ def send_plain_email(to_email, subject, body_text):
 LOGIN_CODES = {}
 CODE_EXPIRY_SECONDS = 10 * 60
 
+# In-memory store of active login sessions: { token: {"email": ..., "expires": epoch_seconds} }
+# Issued by /login-verify once a code is confirmed. Every subscriber-specific
+# endpoint below requires one of these tokens and derives the email FROM the
+# token — it never trusts an email the client just typed into a request body.
+# That's the actual fix: knowing someone's email is no longer enough to read
+# or change their portfolio; you need a live session for that exact account.
+# Same reset-on-restart tradeoff as LOGIN_CODES above — acceptable here since
+# it just means an affected user logs in again, nothing is lost or corrupted.
+SESSION_TOKENS = {}
+SESSION_EXPIRY_SECONDS = 14 * 24 * 60 * 60  # 14 days
+
+
+def get_authenticated_email():
+    """Reads the 'Authorization: Bearer <token>' header, validates it against
+    SESSION_TOKENS, and returns the associated email — or None if the header
+    is missing, the token is unknown, or it has expired. Endpoints that need
+    a logged-in subscriber call this instead of reading email from the
+    request body/query string."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header[len("Bearer "):].strip()
+    entry = SESSION_TOKENS.get(token)
+    if not entry:
+        return None
+    if time.time() > entry["expires"]:
+        del SESSION_TOKENS[token]
+        return None
+    return entry["email"]
+
 
 @app.route("/")
 def home():
@@ -148,11 +179,11 @@ def get_quote(ticker):
 
 @app.route("/portfolio-quotes")
 def portfolio_quotes():
-    """Returns the subscriber's name plus a live price + % change for each
-    ticker in their portfolio. Used by the logged-in home dashboard."""
-    email = request.args.get("email", "").strip()
+    """Returns the logged-in subscriber's name plus a live price + % change
+    for each ticker in their portfolio. Used by the home dashboard."""
+    email = get_authenticated_email()
     if not email:
-        return jsonify({"error": "Email is required"}), 400
+        return jsonify({"error": "Not authenticated. Please log in again."}), 401
 
     try:
         _, record = find_subscriber_row(email)
@@ -331,15 +362,30 @@ def login_verify():
         return jsonify({"error": "Incorrect code."}), 400
 
     del LOGIN_CODES[email]  # one-time use
-    return jsonify({"message": "Logged in successfully"}), 200
+
+    token = secrets.token_urlsafe(32)
+    SESSION_TOKENS[token] = {"email": email, "expires": time.time() + SESSION_EXPIRY_SECONDS}
+
+    return jsonify({"message": "Logged in successfully", "token": token}), 200
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    """Invalidates the current session token server-side, so a stolen/old
+    token can't be reused even if it's still sitting in someone's browser."""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[len("Bearer "):].strip()
+        SESSION_TOKENS.pop(token, None)
+    return jsonify({"message": "Logged out"}), 200
 
 
 @app.route("/get-portfolio")
 def get_portfolio():
-    """Returns a subscriber's current name/portfolio/status by email."""
-    email = request.args.get("email", "").strip()
+    """Returns the logged-in subscriber's current name/portfolio/status."""
+    email = get_authenticated_email()
     if not email:
-        return jsonify({"error": "Email is required"}), 400
+        return jsonify({"error": "Not authenticated. Please log in again."}), 401
 
     try:
         _, record = find_subscriber_row(email)
@@ -359,13 +405,16 @@ def get_portfolio():
 
 @app.route("/update-portfolio", methods=["POST"])
 def update_portfolio():
-    """Overwrites a subscriber's portfolio column."""
+    """Overwrites the logged-in subscriber's portfolio column."""
+    email = get_authenticated_email()
+    if not email:
+        return jsonify({"error": "Not authenticated. Please log in again."}), 401
+
     data = request.get_json(force=True)
-    email = (data.get("email") or "").strip()
     portfolio = (data.get("portfolio") or "").strip()
 
-    if not email or not portfolio:
-        return jsonify({"error": "Email and portfolio are required"}), 400
+    if not portfolio:
+        return jsonify({"error": "Portfolio is required"}), 400
 
     try:
         sheet = get_sheet()
@@ -385,12 +434,10 @@ def update_portfolio():
 
 @app.route("/unsubscribe", methods=["POST"])
 def unsubscribe():
-    """Sets a subscriber's status to inactive."""
-    data = request.get_json(force=True)
-    email = (data.get("email") or "").strip()
-
+    """Sets the logged-in subscriber's status to inactive."""
+    email = get_authenticated_email()
     if not email:
-        return jsonify({"error": "Email is required"}), 400
+        return jsonify({"error": "Not authenticated. Please log in again."}), 401
 
     try:
         sheet = get_sheet()
@@ -401,6 +448,12 @@ def unsubscribe():
         headers = sheet.row_values(1)
         status_col = headers.index("Status") + 1
         sheet.update_cell(row_num, status_col, "inactive")
+
+        # Invalidate this session too — an unsubscribed account shouldn't
+        # keep a live token that could still read/edit anything afterward.
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            SESSION_TOKENS.pop(auth_header[len("Bearer "):].strip(), None)
 
         return jsonify({"message": "Unsubscribed successfully"}), 200
     except Exception as e:

@@ -33,7 +33,76 @@ def get_subscribers():
     return [r for r in rows if str(r.get("Status", "")).lower() == "active"]
 
 
-def get_stock_snapshot(ticker, max_retries=3):
+def get_upcoming_earnings(ticker, days_ahead=7):
+    """Checks Finnhub's earnings calendar for a report date in the next
+    `days_ahead` days. Returns {"date": "2026-08-07", "timing": "after market
+    close"} or None. Silently returns None for ETFs/crypto/funds — Finnhub's
+    calendar just comes back empty for those, no special-casing needed."""
+    from datetime import date, timedelta
+    today = date.today()
+    try:
+        resp = requests.get(
+            "https://finnhub.io/api/v1/calendar/earnings",
+            params={
+                "symbol": ticker,
+                "from": today.isoformat(),
+                "to": (today + timedelta(days=days_ahead)).isoformat(),
+                "token": FINNHUB_API_KEY,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("earningsCalendar", [])
+        if not items:
+            return None
+        items.sort(key=lambda x: x.get("date", ""))
+        soonest = items[0]
+        timing_map = {
+            "bmo": "before market open",
+            "amc": "after market close",
+            "dmh": "during market hours",
+        }
+        return {
+            "date": soonest.get("date"),
+            "timing": timing_map.get(soonest.get("hour"), ""),
+        }
+    except Exception as e:
+        print(f"Earnings calendar check failed for {ticker}: {e}")
+        return None
+
+
+def get_macro_events(days_ahead=5):
+    """Fetches upcoming high-impact US macro events (Fed rate decisions, CPI,
+    jobs reports) from Finnhub's economic calendar. Relevant mainly for
+    broad-market funds/ETFs, which don't have a single-company earnings date
+    but do move on these releases. Fetched once per run and reused across all
+    fund tickers, rather than once per ticker, to avoid redundant API calls."""
+    from datetime import date, timedelta
+    today = date.today()
+    try:
+        resp = requests.get(
+            "https://finnhub.io/api/v1/calendar/economic",
+            params={
+                "from": today.isoformat(),
+                "to": (today + timedelta(days=days_ahead)).isoformat(),
+                "token": FINNHUB_API_KEY,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("economicCalendar", [])
+        high_impact = [
+            e for e in items
+            if str(e.get("country", "")).upper() == "US" and str(e.get("impact", "")).lower() == "high"
+        ]
+        high_impact.sort(key=lambda x: x.get("time", ""))
+        return high_impact[:2]  # keep it to the soonest couple, not a wall of events
+    except Exception as e:
+        print(f"Macro calendar check failed, proceeding without it: {e}")
+        return []
+
+
+def get_stock_snapshot(ticker, macro_events=None, max_retries=3):
     """Pull current price + % change + a recent headline for one ticker via Finnhub."""
     for attempt in range(1, max_retries + 1):
         try:
@@ -78,6 +147,8 @@ def get_stock_snapshot(ticker, max_retries=3):
                 "price": round(current_price, 2),
                 "pct_change": round(pct_change, 2),
                 "headline": headline,
+                "earnings": get_upcoming_earnings(ticker),
+                "macro_events": (macro_events or []) if ticker in KNOWN_FUNDS else [],
             }
         except Exception as e:
             print(f"Attempt {attempt}/{max_retries} failed for {ticker}: {e}")
@@ -119,10 +190,10 @@ KNOWN_FUNDS = {
 # Rotated through so consecutive blurbs don't all lean on the same opening
 # word/structure (e.g. everything starting with "Historically...").
 STYLE_HINTS = [
-    "Open with the price move itself, then add historical context.",
-    "Open with the news/headline angle, then connect it to the price move.",
-    "Open with a brief historical parallel, then tie it back to today's move.",
-    "Open by framing the size of the move (small/moderate/large relative to typical daily swings), then add context.",
+    "Open with the upcoming date/event if there is one, then connect it to today's price move.",
+    "Open with the price move itself, then pivot straight to what's coming up next.",
+    "Open with the news/headline angle, then connect it to what's ahead.",
+    "Open by framing the size of today's move (small/moderate/large relative to typical daily swings), then get to what's next.",
 ]
 
 
@@ -153,6 +224,21 @@ def generate_blurb(snapshot, variation_index=0):
 
     style_hint = STYLE_HINTS[variation_index % len(STYLE_HINTS)]
 
+    if snapshot.get("earnings"):
+        e = snapshot["earnings"]
+        timing_str = f" ({e['timing']})" if e["timing"] else ""
+        earnings_line = f"Upcoming earnings: reports on {e['date']}{timing_str}."
+    else:
+        earnings_line = "Upcoming earnings: none scheduled in the next 7 days."
+
+    macro_line = ""
+    if snapshot.get("macro_events"):
+        events_desc = "; ".join(
+            f"{e.get('event', 'Economic release')} on {str(e.get('time', ''))[:10]}"
+            for e in snapshot["macro_events"]
+        )
+        macro_line = f"Upcoming macro events (relevant to broad-market funds): {events_desc}."
+
     prompt = f"""You are writing content for an educational investing newsletter, covering one ticker.
 
 Ticker: {snapshot['ticker']}
@@ -160,14 +246,31 @@ Ticker: {snapshot['ticker']}
 Current price: ${snapshot['price']}
 Change since last close: {snapshot['pct_change']}%
 Recent headline: {snapshot['headline'] or 'No major headline today'}
+{earnings_line}
+{macro_line}
 
 Produce TWO things:
-1. A short, catchy, punny/playful headline (max 8 words) related to the news or price move —
-   think newspaper-style wordplay tied to the company/fund or what's happening
+1. A short, catchy, punny/playful headline (max 8 words) related to the news, price move, or
+   upcoming date above — think newspaper-style wordplay tied to the company/fund or what's happening
    (e.g. for a rocket company having a good day: "SpaceX Shoots for the Moon").
    The headline must NOT imply the reader should buy, sell, or take any action.
-2. A brief, neutral, educational paragraph (2-3 sentences) about what historically tends to follow
-   this kind of move or news.
+2. A brief paragraph (2-3 sentences) that prioritizes FORWARD-LOOKING, factual information —
+   readers want to know what's coming up and what could move the price next, not just what already
+   happened. Follow this priority order:
+   a) If there's an upcoming earnings date listed above, LEAD with it — state the date (and timing,
+      if known) plainly. This is the single most useful thing you can tell a reader holding this stock.
+   b) If there are upcoming macro events listed above (for funds/ETFs), lead with those instead —
+      funds don't have their own earnings, so Fed decisions, inflation data, and jobs reports are
+      the equivalent "what's coming up" information for them.
+   c) Read the "Recent headline" carefully for any OTHER concrete, forward-looking catalyst it
+      mentions or implies — e.g. a pending FDA decision, a scheduled court ruling, a merger vote
+      date, a product launch, a regulatory deadline. If one is there, surface it plainly, since
+      this is exactly the kind of thing that can move the price and readers want to know about it.
+   d) Only if there is genuinely nothing forward-looking to report from (a)-(c), fall back to a
+      short neutral note on what historically tends to follow this kind of move — this is the
+      last resort, not the default.
+   Never predict which way the price will move because of any of the above. State facts and known
+   dates, not forecasts.
 
 READABILITY — this is written for everyday personal investors, not finance professionals. Follow these
 rules strictly:
@@ -179,15 +282,19 @@ rules strictly:
   clear and conversational, not textbook or press-release toned.
 - Prefer concrete, everyday comparisons over abstract financial concepts.
 
-STYLE for the paragraph: {style_hint} Avoid starting with the word "Historically" — vary sentence openings
+STYLE: {style_hint} Avoid starting with the word "Historically" — vary sentence openings
 and structure so this doesn't read like a template repeated for every stock. Keep the actual information
-(price move, context, historical pattern) the same regardless of phrasing style.
+(price move, upcoming dates, catalysts) the same regardless of phrasing style.
 
 STRICT RULES — these are non-negotiable, for BOTH the headline and paragraph:
 - Do NOT use the words "buy," "sell," "hold," or any variation telling the reader what to do.
 - Do NOT recommend, suggest, or imply any action the reader should take.
 - Do NOT say things like "good time to," "bad time to," "worth considering," or similar action-nudging phrases.
-- Only describe historical patterns and context — never advice, opinions, or predictions framed as guidance.
+- Do NOT predict future price direction ("will likely rise/fall") — stating a known upcoming date or
+  event (like an earnings date or FDA decision date) is fine; guessing what happens to the price
+  because of it is not.
+- Do not invent a catalyst that isn't actually in the headline/data above — only surface what's
+  genuinely there.
 - Do not add a disclaimer sentence — one is added separately in the email template.
 
 Respond ONLY with valid JSON in this exact format, nothing else, no markdown code fences:
@@ -351,6 +458,9 @@ def main():
     subscribers = get_subscribers()
     print(f"Found {len(subscribers)} active subscribers")
 
+    # Fetch once per run (not per ticker) — reused for every fund/ETF snapshot.
+    macro_events = get_macro_events()
+
     # Cache stock snapshots/blurbs so we don't re-fetch/re-generate per subscriber
     # if multiple people hold the same stock.
     cache = {}
@@ -372,7 +482,7 @@ def main():
             stock_sections = []
             for ticker in portfolio:
                 if ticker not in cache:
-                    snapshot = get_stock_snapshot(ticker)
+                    snapshot = get_stock_snapshot(ticker, macro_events=macro_events)
                     if snapshot:
                         # Vary style based on how many unique tickers we've already
                         # generated, so back-to-back blurbs in one email don't match.

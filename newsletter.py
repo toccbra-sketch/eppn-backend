@@ -76,35 +76,44 @@ def get_upcoming_earnings(ticker, days_ahead=7):
         return None
 
 
+# FOMC meeting decision dates, pulled directly from federalreserve.gov's official
+# published schedule (https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm).
+# The Fed publishes these roughly a year or more in advance and they essentially
+# never move, so a small hardcoded table here is more reliable than an API call —
+# and it's free, unlike Finnhub's economic-calendar endpoint (which requires a
+# paid plan). Each entry is the SECOND day of the two-day meeting, since that's
+# when the rate decision is actually announced, at 2:00 PM ET.
+# Maintenance: add next year's dates here once the Fed publishes them (usually
+# announced each August/September for the following year).
+FOMC_DECISION_DATES = [
+    # 2026
+    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+    "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
+    # 2027
+    "2027-01-27", "2027-03-17", "2027-04-28", "2027-06-09",
+    "2027-07-28", "2027-09-15", "2027-10-27", "2027-12-08",
+]
+
+
 def get_macro_events(days_ahead=5):
-    """Fetches upcoming high-impact US macro events (Fed rate decisions, CPI,
-    jobs reports) from Finnhub's economic calendar. Relevant mainly for
-    broad-market funds/ETFs, which don't have a single-company earnings date
-    but do move on these releases. Fetched once per run and reused across all
-    fund tickers, rather than once per ticker, to avoid redundant API calls."""
+    """Checks the hardcoded FOMC schedule for a rate decision in the next
+    `days_ahead` days. Relevant mainly for broad-market funds/ETFs, which
+    don't have a single-company earnings date but do move on Fed decisions.
+    Returns a list shaped like [{"event": ..., "time": "YYYY-MM-DD"}] to match
+    what generate_blurb expects — same shape as the old Finnhub-based version,
+    so nothing downstream needed to change."""
     from datetime import date, timedelta
     today = date.today()
-    try:
-        resp = requests.get(
-            "https://finnhub.io/api/v1/calendar/economic",
-            params={
-                "from": today.isoformat(),
-                "to": (today + timedelta(days=days_ahead)).isoformat(),
-                "token": FINNHUB_API_KEY,
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        items = resp.json().get("economicCalendar", [])
-        high_impact = [
-            e for e in items
-            if str(e.get("country", "")).upper() == "US" and str(e.get("impact", "")).lower() == "high"
-        ]
-        high_impact.sort(key=lambda x: x.get("time", ""))
-        return high_impact[:2]  # keep it to the soonest couple, not a wall of events
-    except Exception as e:
-        print(f"Macro calendar check failed, proceeding without it: {e}")
+    cutoff = today + timedelta(days=days_ahead)
+
+    upcoming = [
+        d for d in FOMC_DECISION_DATES
+        if today.isoformat() <= d <= cutoff.isoformat()
+    ]
+    if not upcoming:
         return []
+
+    return [{"event": "Fed interest rate decision", "time": upcoming[0]}]
 
 
 def get_stock_snapshot(ticker, macro_events=None, max_retries=3):

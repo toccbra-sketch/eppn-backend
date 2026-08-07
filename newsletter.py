@@ -1,9 +1,6 @@
 import os
 import json
 import re
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -15,10 +12,18 @@ import anthropic
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 FINNHUB_API_KEY = os.environ["FINNHUB_API_KEY"]
-EMAIL_ADDRESS = os.environ["EMAIL_ADDRESS"]
-EMAIL_APP_PASSWORD = os.environ["EMAIL_APP_PASSWORD"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 SHEET_NAME = os.environ.get("SHEET_NAME", "Subscribers")
+
+# --- Brevo (email API) setup ---
+# Same reasoning as app.py: sending via Brevo's HTTPS API instead of raw SMTP
+# means we can send from a real domain address (contact@theportfoliobriefcase.com)
+# with proper SPF/DKIM authentication once the domain is verified in Brevo —
+# something plain Gmail SMTP could never do, and it's the single biggest lever
+# for staying out of spam folders.
+BREVO_API_KEY = os.environ["BREVO_API_KEY"]
+EMAIL_ADDRESS = os.environ["EMAIL_ADDRESS"]  # must be a verified sender/domain in Brevo
+SENDER_NAME = os.environ.get("SENDER_NAME", "The Portfolio Briefcase")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -365,7 +370,7 @@ def build_email_html(name, stock_sections):
     BORDER = "#dcdfe4"
     PAPER = "#f6f5f1"
 
-    SITE_BASE = "https://toccbra-sketch.github.io/eppn-website"
+    SITE_BASE = "https://theportfoliobriefcase.com"
 
     sections_html = ""
     for s in stock_sections:
@@ -448,7 +453,7 @@ def build_email_html(name, stock_sections):
             <p style="{disclaimer_style}"><strong>Data accuracy.</strong> Price and market data is provided by third-party sources and may be delayed, incomplete, or occasionally inaccurate.</p>
             <p style="{disclaimer_style}"><strong>Past performance.</strong> Historical patterns referenced in this newsletter are not indicative of future results.</p>
             <p style="{disclaimer_style}"><strong>No advisory relationship.</strong> The Portfolio Briefcase is not a registered investment advisor and does not act in a fiduciary capacity for subscribers.</p>
-            <p style="{disclaimer_style}">Can't find a ticker, or does something look off — missing news, an unclear price, or anything else that doesn't seem right? Email us at <a href="mailto:YOUR_EMAIL_HERE@example.com" style="color:{NAVY_700};">YOUR_EMAIL_HERE@example.com</a> and we'll look into adding it.</p>
+            <p style="{disclaimer_style}">Can't find a ticker, or does something look off — missing news, an unclear price, or anything else that doesn't seem right? Email us at <a href="mailto:contact@theportfoliobriefcase.com" style="color:{NAVY_700};">contact@theportfoliobriefcase.com</a> and we'll look into adding it.</p>
             <p style="font-family:Arial,sans-serif; font-size:12px; margin:0 0 10px;">
               <a href="{SITE_BASE}/edit-portfolio.html" style="color:{NAVY_700};">Edit portfolio</a> &nbsp;|&nbsp;
               <a href="{SITE_BASE}/unsubscribe.html" style="color:{NAVY_700};">Unsubscribe</a>
@@ -466,13 +471,24 @@ def build_email_html(name, stock_sections):
     """
 
 
-def send_email(server, to_email, subject, html_body):
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_ADDRESS
-    msg["To"] = to_email
-    msg.attach(MIMEText(html_body, "html"))
-    server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
+def send_email(to_email, subject, html_body):
+    resp = requests.post(
+        "https://api.brevo.com/v3/smtp/email",
+        headers={
+            "api-key": BREVO_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        json={
+            "sender": {"name": SENDER_NAME, "email": EMAIL_ADDRESS},
+            "to": [{"email": to_email}],
+            "subject": subject,
+            "htmlContent": html_body,
+        },
+        timeout=15,
+    )
+    if resp.status_code >= 300:
+        raise Exception(f"Brevo API error {resp.status_code}: {resp.text}")
 
 
 def is_trading_day():
@@ -514,43 +530,39 @@ def main():
     # if multiple people hold the same stock.
     cache = {}
 
-    # Open ONE SMTP connection and reuse it for every email, instead of
-    # reconnecting/logging in from scratch per subscriber (this was the main
-    # slowdown as subscriber count grows).
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+    # Brevo's API is stateless HTTPS — no persistent connection to open/hold
+    # like the old SMTP approach, each send is just its own request.
+    for sub in subscribers:
+        name = sub.get("Name", "there")
+        email = sub.get("Email")
+        portfolio = [t.strip().upper() for t in sub.get("Portfolio", "").split(",") if t.strip()]
 
-        for sub in subscribers:
-            name = sub.get("Name", "there")
-            email = sub.get("Email")
-            portfolio = [t.strip().upper() for t in sub.get("Portfolio", "").split(",") if t.strip()]
+        if not email or not portfolio:
+            continue
 
-            if not email or not portfolio:
-                continue
+        stock_sections = []
+        for ticker in portfolio:
+            if ticker not in cache:
+                snapshot = get_stock_snapshot(ticker, macro_events=macro_events)
+                if snapshot:
+                    # Vary style based on how many unique tickers we've already
+                    # generated, so back-to-back blurbs in one email don't match.
+                    snapshot["blurb"] = generate_blurb(snapshot, variation_index=len(cache))
+                    cache[ticker] = snapshot
+                else:
+                    continue
+            stock_sections.append(cache[ticker])
 
-            stock_sections = []
-            for ticker in portfolio:
-                if ticker not in cache:
-                    snapshot = get_stock_snapshot(ticker, macro_events=macro_events)
-                    if snapshot:
-                        # Vary style based on how many unique tickers we've already
-                        # generated, so back-to-back blurbs in one email don't match.
-                        snapshot["blurb"] = generate_blurb(snapshot, variation_index=len(cache))
-                        cache[ticker] = snapshot
-                    else:
-                        continue
-                stock_sections.append(cache[ticker])
+        if not stock_sections:
+            print(f"No valid stock data for {email}, skipping")
+            continue
 
-            if not stock_sections:
-                print(f"No valid stock data for {email}, skipping")
-                continue
-
-            html = build_email_html(name, stock_sections)
-            try:
-                send_email(server, email, "Your daily portfolio update — The Portfolio Briefcase", html)
-                print(f"Sent to {email}")
-            except Exception as e:
-                print(f"Failed to send to {email}: {e}")
+        html = build_email_html(name, stock_sections)
+        try:
+            send_email(email, "Your daily portfolio update — The Portfolio Briefcase", html)
+            print(f"Sent to {email}")
+        except Exception as e:
+            print(f"Failed to send to {email}: {e}")
 
 
 if __name__ == "__main__":

@@ -2,11 +2,20 @@ name: Send Daily Newsletter
 
 on:
   schedule:
-    # Runs at 12:00 UTC, Monday through Friday only
-    # (UTC 12:00 = 8:00 AM Eastern during daylight saving time, 7:00 AM Eastern in winter)
-    # Actual US market holidays (Thanksgiving, Christmas, etc.) are still filtered
-    # out inside newsletter.py itself, since cron has no concept of holidays.
-    - cron: '0 12 * * 1-5'
+    # Runs at 8:05 AM Eastern, Monday through Friday. GitHub added a `timezone`
+    # field to cron in March 2026 — this handles the EST/EDT switch
+    # automatically, so no more manually converting to UTC by hand.
+    #
+    # Also offset 5 minutes past the hour on purpose: GitHub's own docs warn
+    # that scheduled workflows are most likely to be delayed right at the top
+    # of the hour, since that's when Actions load peaks across all of GitHub.
+    # A few minutes' offset avoids that specific congestion window.
+    #
+    # Actual US market holidays (Thanksgiving, Christmas, etc.) are still
+    # filtered out inside newsletter.py itself, since cron has no concept of
+    # holidays.
+    - cron: '5 8 * * 1-5'
+      timezone: 'America/New_York'
   workflow_dispatch: {}  # lets you manually trigger a run from the GitHub Actions tab, for testing
 
 jobs:

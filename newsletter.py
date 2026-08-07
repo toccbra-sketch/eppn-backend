@@ -351,69 +351,114 @@ Respond ONLY with valid JSON in this exact format, nothing else, no markdown cod
 
 
 def build_email_html(name, stock_sections):
+    # Colors matched to eppn-common.css so the email looks like an extension
+    # of the site rather than a separate, older-looking product.
+    NAVY_900 = "#0a1930"
+    NAVY_700 = "#17365f"
+    UP = "#1e6b45"
+    DOWN = "#a13d2e"
+    MUTED = "#667085"
+    BORDER = "#dcdfe4"
+    PAPER = "#f6f5f1"
+
+    SITE_BASE = "https://toccbra-sketch.github.io/eppn-website"
+
     sections_html = ""
     for s in stock_sections:
-        arrow = "▲" if s["pct_change"] >= 0 else "▼"
+        is_up = s["pct_change"] >= 0
+        arrow = "▲" if is_up else "▼"
+        color = UP if is_up else DOWN
         headline = s["blurb"]["headline"]
         body = s["blurb"]["body"]
         # Display-friendly ticker: strip exchange prefix for crypto (e.g.
         # "BINANCE:BTCUSDT" shows as "BTCUSDT") so it doesn't look technical.
         display_ticker = s['ticker'].split(":")[-1] if ":" in s['ticker'] else s['ticker']
         sections_html += f"""
-        <div style="margin-bottom:20px; padding:14px; border:1px solid #ddd; border-radius:6px;">
-          <h2 style="margin:0 0 4px; font-size:17px; color:#1a1a1a;">{headline}</h2>
-          <div style="font-size:13px; color:#555; margin-bottom:8px; font-weight:bold;">
-            {display_ticker} &nbsp;·&nbsp; ${s['price']} &nbsp;<span style="color:#555;">{arrow}</span> {abs(s['pct_change'])}%
-          </div>
-          <p style="margin:0; color:#333;">{body}</p>
-        </div>
+        <tr><td style="padding:0 0 12px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {BORDER}; border-radius:6px;">
+            <tr><td style="padding:16px;">
+              <div style="font-family:Georgia,'Times New Roman',serif; font-size:17px; color:{NAVY_900}; margin-bottom:6px;">{headline}</div>
+              <div style="font-family:Arial,sans-serif; font-size:13px; font-weight:bold; color:{MUTED}; margin-bottom:8px;">
+                {display_ticker} &nbsp;·&nbsp; ${s['price']} &nbsp;<span style="color:{color};">{arrow} {abs(s['pct_change'])}%</span>
+              </div>
+              <div style="font-family:Arial,sans-serif; font-size:14px; color:#333; line-height:1.5;">{body}</div>
+            </td></tr>
+          </table>
+        </td></tr>
         """
 
     from datetime import datetime
     import zoneinfo
     timestamp = datetime.now(zoneinfo.ZoneInfo("America/New_York")).strftime("%B %-d, %Y — %-I:%M %p ET")
 
+    disclaimer_style = f"font-family:Arial,sans-serif; font-size:11px; color:#888; line-height:1.5; margin:0 0 10px;"
+
     return f"""
-    <div style="font-family:Arial, sans-serif; max-width:600px; margin:auto;">
-      <h2 style="margin-bottom:2px;">Your daily portfolio update</h2>
-      <p style="font-size:12px; color:#888; margin-top:0;">Prices as of {timestamp}</p>
-      <p>Hi {name}, here's what's happening with your stocks today.</p>
-      {sections_html}
-      <p style="font-size:12px; color:#777; margin-top:24px;">
-        <strong>Educational content only.</strong> This newsletter shares general market information
-        and historical context — it is not financial advice, and nothing here is a recommendation
-        to buy, sell, or hold any investment.
-      </p>
-      <p style="font-size:12px; color:#777;">
-        <strong>AI-generated content.</strong> The write-ups above are created using AI and may contain
-        mistakes or inaccuracies. Always verify important details yourself before making any decisions
-        about your portfolio.
-      </p>
-      <p style="font-size:12px; color:#777;">
-        <strong>Data accuracy.</strong> Price and market data is provided by third-party sources and may
-        be delayed, incomplete, or occasionally inaccurate.
-      </p>
-      <p style="font-size:12px; color:#777;">
-        <strong>Past performance.</strong> Historical patterns referenced in this newsletter are not
-        indicative of future results.
-      </p>
-      <p style="font-size:12px; color:#777;">
-        <strong>No advisory relationship.</strong> EPPN is not a registered investment advisor and does
-        not act in a fiduciary capacity for subscribers.
-      </p>
-      <p style="font-size:12px; color:#777;">
-        Can't find a ticker, or does something look off — missing news, an unclear price, or
-        anything else that doesn't seem right? Email us at
-        <a href="mailto:YOUR_EMAIL_HERE@example.com">YOUR_EMAIL_HERE@example.com</a> and we'll look into adding it.
-      </p>
-      <p style="font-size:12px;">
-        <a href="https://yourdomain.com/edit-portfolio">Edit portfolio</a> |
-        <a href="https://yourdomain.com/unsubscribe">Unsubscribe</a>
-      </p>
-      <p style="font-size:11px; color:#aaa;">
-        [Your business mailing address here — required by the CAN-SPAM Act for commercial email]
-      </p>
-    </div>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:{PAPER};">
+    <tr><td align="center" style="padding:24px 16px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px; background:#ffffff; border-radius:6px; overflow:hidden;">
+
+      <!-- Header -->
+      <tr><td style="background:{NAVY_900}; padding:18px 20px;">
+        <table role="presentation" cellpadding="0" cellspacing="0"><tr>
+          <td style="padding-right:9px; vertical-align:middle;">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect x="2.5" y="8" width="19" height="12.5" rx="1.8" stroke="#ffffff" stroke-width="1.6"/>
+              <path d="M8.5 8V6.3C8.5 5.1 9.5 4 10.8 4H13.2C14.5 4 15.5 5.1 15.5 6.3V8" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round"/>
+              <rect x="10.3" y="12.5" width="3.4" height="2.4" rx="0.5" fill="#ffffff"/>
+            </svg>
+          </td>
+          <td style="font-family:Georgia,'Times New Roman',serif; font-size:19px; color:#ffffff; vertical-align:middle;">
+            The Portfolio Briefcase
+          </td>
+        </tr></table>
+      </td></tr>
+
+      <!-- Body -->
+      <tr><td style="padding:22px 20px;">
+        <div style="font-family:Georgia,'Times New Roman',serif; font-size:20px; color:{NAVY_900}; margin-bottom:2px;">
+          Your daily portfolio update
+        </div>
+        <div style="font-family:Arial,sans-serif; font-size:12px; color:#999; margin-bottom:14px;">
+          Prices as of {timestamp}
+        </div>
+        <div style="font-family:Arial,sans-serif; font-size:14px; color:#333; margin-bottom:16px;">
+          Hi {name}, here's what's happening with your stocks today.
+        </div>
+
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+          {sections_html}
+        </table>
+
+        <div style="text-align:center; margin:20px 0 4px;">
+          <a href="{SITE_BASE}/index.html" style="display:inline-block; background:{NAVY_700}; color:#ffffff; font-family:Arial,sans-serif; font-size:14px; font-weight:bold; text-decoration:none; padding:11px 22px; border-radius:4px;">
+            View your dashboard
+          </a>
+        </div>
+
+        <!-- Disclaimers -->
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px; padding-top:14px; border-top:1px solid {BORDER};">
+          <tr><td>
+            <p style="{disclaimer_style}"><strong>Educational content only.</strong> This newsletter shares general market information and historical context — it is not financial advice, and nothing here is a recommendation to buy, sell, or hold any investment.</p>
+            <p style="{disclaimer_style}"><strong>AI-generated content.</strong> The write-ups above are created using AI and may contain mistakes or inaccuracies. Always verify important details yourself before making any decisions about your portfolio.</p>
+            <p style="{disclaimer_style}"><strong>Data accuracy.</strong> Price and market data is provided by third-party sources and may be delayed, incomplete, or occasionally inaccurate.</p>
+            <p style="{disclaimer_style}"><strong>Past performance.</strong> Historical patterns referenced in this newsletter are not indicative of future results.</p>
+            <p style="{disclaimer_style}"><strong>No advisory relationship.</strong> The Portfolio Briefcase is not a registered investment advisor and does not act in a fiduciary capacity for subscribers.</p>
+            <p style="{disclaimer_style}">Can't find a ticker, or does something look off — missing news, an unclear price, or anything else that doesn't seem right? Email us at <a href="mailto:YOUR_EMAIL_HERE@example.com" style="color:{NAVY_700};">YOUR_EMAIL_HERE@example.com</a> and we'll look into adding it.</p>
+            <p style="font-family:Arial,sans-serif; font-size:12px; margin:0 0 10px;">
+              <a href="{SITE_BASE}/edit-portfolio.html" style="color:{NAVY_700};">Edit portfolio</a> &nbsp;|&nbsp;
+              <a href="{SITE_BASE}/unsubscribe.html" style="color:{NAVY_700};">Unsubscribe</a>
+            </p>
+            <p style="font-family:Arial,sans-serif; font-size:11px; color:#aaa; margin:0;">
+              [Your business mailing address here — required by the CAN-SPAM Act for commercial email]
+            </p>
+          </td></tr>
+        </table>
+      </td></tr>
+
+    </table>
+    </td></tr>
+    </table>
     """
 
 
@@ -498,7 +543,7 @@ def main():
 
             html = build_email_html(name, stock_sections)
             try:
-                send_email(server, email, "Your daily portfolio update — EPPN", html)
+                send_email(server, email, "Your daily portfolio update — The Portfolio Briefcase", html)
                 print(f"Sent to {email}")
             except Exception as e:
                 print(f"Failed to send to {email}: {e}")

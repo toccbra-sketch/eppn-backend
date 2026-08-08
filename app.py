@@ -2,6 +2,7 @@ import os
 import json
 import time
 import random
+import re
 import secrets
 import requests
 from flask import Flask, request, jsonify
@@ -48,8 +49,17 @@ def find_subscriber_row(email):
     return None, None
 
 
-def send_plain_email(to_email, subject, body_text):
+def send_plain_email(to_email, subject, body_text, reply_to=None):
     print(f"[send_plain_email] sending via Brevo API to {to_email}...")
+    payload = {
+        "sender": {"name": SENDER_NAME, "email": EMAIL_ADDRESS},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "textContent": body_text,
+    }
+    if reply_to:
+        payload["replyTo"] = {"email": reply_to}
+
     resp = requests.post(
         "https://api.brevo.com/v3/smtp/email",
         headers={
@@ -57,12 +67,7 @@ def send_plain_email(to_email, subject, body_text):
             "Content-Type": "application/json",
             "Accept": "application/json",
         },
-        json={
-            "sender": {"name": SENDER_NAME, "email": EMAIL_ADDRESS},
-            "to": [{"email": to_email}],
-            "subject": subject,
-            "textContent": body_text,
-        },
+        json=payload,
         timeout=15,
     )
     if resp.status_code >= 300:
@@ -296,6 +301,52 @@ def subscribe():
         return jsonify({"error": "Could not save subscriber"}), 500
 
     return jsonify({"message": "Subscribed successfully"}), 200
+
+
+@app.route("/feedback", methods=["POST"])
+def feedback():
+    """Sends a feedback submission straight to the site owner's inbox via
+    Brevo, with reply-to set to the submitter's email (if given) so replying
+    to the notification goes straight back to them."""
+    data = request.get_json(force=True)
+
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip()
+    message = (data.get("message") or "").strip()
+    # Honeypot: a hidden field real users never see or fill in. If it has a
+    # value, this was almost certainly a bot — pretend success without
+    # actually sending, so the bot doesn't learn to try something else.
+    honeypot = (data.get("website") or "").strip()
+
+    if honeypot:
+        return jsonify({"message": "Thanks for your feedback!"}), 200
+
+    if not message:
+        return jsonify({"error": "Message is required"}), 400
+    if len(message) > 5000:
+        return jsonify({"error": "Message is too long"}), 400
+    if email and not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email):
+        return jsonify({"error": "That email address doesn't look valid"}), 400
+
+    body_text = (
+        f"New feedback submitted via the site.\n\n"
+        f"Name: {name or 'Not provided'}\n"
+        f"Email: {email or 'Not provided'}\n\n"
+        f"Message:\n{message}"
+    )
+
+    try:
+        send_plain_email(
+            EMAIL_ADDRESS,
+            "New feedback — The Portfolio Briefcase",
+            body_text,
+            reply_to=email or None,
+        )
+    except Exception as e:
+        print("Feedback email error:", e)
+        return jsonify({"error": "Could not send feedback right now. Please try again."}), 500
+
+    return jsonify({"message": "Thanks for your feedback!"}), 200
 
 
 @app.route("/login-request", methods=["POST"])

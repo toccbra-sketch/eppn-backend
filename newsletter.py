@@ -483,7 +483,9 @@ def build_email_html(name, stock_sections):
             <p style="{disclaimer_style}">Can't find a ticker, or does something look off — missing news, an unclear price, or anything else that doesn't seem right? Email us at <a href="mailto:contact@theportfoliobriefcase.com" style="color:{NAVY_700};">contact@theportfoliobriefcase.com</a> and we'll look into adding it.</p>
             <p style="font-family:Arial,sans-serif; font-size:12px; margin:0 0 10px;">
               <a href="{SITE_BASE}/edit-portfolio.html" style="color:{NAVY_700};">Edit portfolio</a> &nbsp;|&nbsp;
-              <a href="{SITE_BASE}/unsubscribe.html" style="color:{NAVY_700};">Unsubscribe</a>
+              <a href="{SITE_BASE}/unsubscribe.html" style="color:{NAVY_700};">Unsubscribe</a> &nbsp;|&nbsp;
+              <a href="{SITE_BASE}/privacy-policy.html" style="color:{NAVY_700};">Privacy Policy</a> &nbsp;|&nbsp;
+              <a href="{SITE_BASE}/terms.html" style="color:{NAVY_700};">Terms of Service</a>
             </p>
             <p style="font-family:Arial,sans-serif; font-size:11px; color:#aaa; margin:0;">
               [Your business mailing address here — required by the CAN-SPAM Act for commercial email]

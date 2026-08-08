@@ -14,6 +14,7 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 FINNHUB_API_KEY = os.environ["FINNHUB_API_KEY"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 SHEET_NAME = os.environ.get("SHEET_NAME", "Subscribers")
+SPONSOR_SHEET_NAME = os.environ.get("SPONSOR_SHEET_NAME", "Sponsors")
 
 # --- Brevo (email API) setup ---
 # Same reasoning as app.py: sending via Brevo's HTTPS API instead of raw SMTP
@@ -36,6 +37,54 @@ def get_subscribers():
     sheet = client.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
     rows = sheet.get_all_records()  # expects headers: Name, Email, Portfolio, Status
     return [r for r in rows if str(r.get("Status", "")).lower() == "active"]
+
+
+def get_active_sponsor():
+    """Reads the Sponsors sheet tab for a currently-active sponsor slot.
+    Expected headers: Active, Name, Blurb, LinkURL, StartDate, EndDate, Clicks.
+    StartDate/EndDate are optional (YYYY-MM-DD) — leave blank for no expiry.
+    Returns {"name", "blurb", "row"} or None. This fails safe: a missing tab,
+    bad date format, or any other error just means no sponsor shows that day —
+    it never breaks the newsletter send. Note: no LinkURL is returned here on
+    purpose — the email links to a backend redirect that looks up the URL
+    itself from this same sheet, so the link never carries the destination in
+    a client-visible way (keeps the redirect endpoint from being an open
+    redirect anyone could repurpose)."""
+    from datetime import date
+    try:
+        creds_json = os.environ["GOOGLE_CREDENTIALS_JSON"]
+        creds_dict = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(SPREADSHEET_ID).worksheet(SPONSOR_SHEET_NAME)
+        records = sheet.get_all_records()
+        today = date.today()
+
+        for i, r in enumerate(records, start=2):  # row 1 is headers
+            if str(r.get("Active", "")).strip().upper() not in ("TRUE", "YES", "1"):
+                continue
+
+            start_str = str(r.get("StartDate", "")).strip()
+            end_str = str(r.get("EndDate", "")).strip()
+            try:
+                if start_str and date.fromisoformat(start_str) > today:
+                    continue
+                if end_str and date.fromisoformat(end_str) < today:
+                    continue
+            except ValueError:
+                pass  # bad date format in the sheet — ignore date gating rather than crash
+
+            name = str(r.get("Name", "")).strip()
+            blurb = str(r.get("Blurb", "")).strip()
+            if not name or not blurb:
+                continue
+
+            return {"name": name, "blurb": blurb, "row": i}
+
+        return None
+    except Exception as e:
+        print(f"Sponsor lookup failed, proceeding without a sponsor slot: {e}")
+        return None
 
 
 def get_upcoming_earnings(ticker, days_ahead=7):
@@ -386,7 +435,7 @@ Call the submit_blurb tool with your headline and body."""
     return {"headline": headline, "body": body}
 
 
-def build_email_html(name, stock_sections):
+def build_email_html(name, stock_sections, sponsor=None):
     # Colors matched to eppn-common.css so the email looks like an extension
     # of the site rather than a separate, older-looking product.
     NAVY_900 = "#0a1930"
@@ -398,6 +447,7 @@ def build_email_html(name, stock_sections):
     PAPER = "#f6f5f1"
 
     SITE_BASE = "https://theportfoliobriefcase.com"
+    BACKEND_BASE = "https://eppn-backend.onrender.com"
 
     sections_html = ""
     for s in stock_sections:
@@ -428,6 +478,20 @@ def build_email_html(name, stock_sections):
     timestamp = datetime.now(zoneinfo.ZoneInfo("America/New_York")).strftime("%B %-d, %Y — %-I:%M %p ET")
 
     disclaimer_style = f"font-family:Arial,sans-serif; font-size:11px; color:#888; line-height:1.5; margin:0 0 10px;"
+
+    sponsor_html = ""
+    if sponsor:
+        sponsor_link = f"{BACKEND_BASE}/sponsor-click?row={sponsor['row']}"
+        sponsor_html = f"""
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px; border:1px dashed {BORDER}; border-radius:6px; background:#fafaf8;">
+          <tr><td style="padding:14px 16px;">
+            <div style="font-family:Arial,sans-serif; font-size:10px; font-weight:bold; letter-spacing:0.6px; text-transform:uppercase; color:{MUTED}; margin-bottom:6px;">Sponsored</div>
+            <div style="font-family:Georgia,'Times New Roman',serif; font-size:15px; color:{NAVY_900}; margin-bottom:4px;">{sponsor['name']}</div>
+            <div style="font-family:Arial,sans-serif; font-size:13px; color:#333; line-height:1.5; margin-bottom:8px;">{sponsor['blurb']}</div>
+            <a href="{sponsor_link}" style="font-family:Arial,sans-serif; font-size:13px; font-weight:bold; color:{NAVY_700};">Learn more &rarr;</a>
+          </td></tr>
+        </table>
+        """
 
     return f"""
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:{PAPER};">
@@ -465,6 +529,8 @@ def build_email_html(name, stock_sections):
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
           {sections_html}
         </table>
+
+        {sponsor_html}
 
         <div style="text-align:center; margin:20px 0 4px;">
           <a href="{SITE_BASE}/index.html" style="display:inline-block; background:{NAVY_700}; color:#ffffff; font-family:Arial,sans-serif; font-size:14px; font-weight:bold; text-decoration:none; padding:11px 22px; border-radius:4px;">
@@ -554,6 +620,7 @@ def main():
 
     # Fetch once per run (not per ticker) — reused for every fund/ETF snapshot.
     macro_events = get_macro_events()
+    sponsor = get_active_sponsor()
 
     # Cache stock snapshots/blurbs so we don't re-fetch/re-generate per subscriber
     # if multiple people hold the same stock.
@@ -586,7 +653,7 @@ def main():
             print(f"No valid stock data for {email}, skipping")
             continue
 
-        html = build_email_html(name, stock_sections)
+        html = build_email_html(name, stock_sections, sponsor=sponsor)
         try:
             send_email(email, "Your daily portfolio update — The Portfolio Briefcase", html)
             print(f"Sent to {email}")

@@ -5,7 +5,7 @@ import random
 import re
 import secrets
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 import gspread
 from google.oauth2.service_account import Credentials
@@ -16,6 +16,7 @@ CORS(app)  # allows your GitHub Pages site to call this backend
 # --- Google Sheets setup ---
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 FINNHUB_API_KEY = os.environ["FINNHUB_API_KEY"]
+SPONSOR_SHEET_NAME = os.environ.get("SPONSOR_SHEET_NAME", "Sponsors")
 
 # --- Brevo (email API) setup ---
 # We send email via Brevo's HTTPS API instead of raw SMTP because Render's free
@@ -26,7 +27,7 @@ EMAIL_ADDRESS = os.environ["EMAIL_ADDRESS"]  # must be a verified sender in Brev
 SENDER_NAME = os.environ.get("SENDER_NAME", "The Portfolio Briefcase")
 
 
-def get_sheet():
+def get_sheet(sheet_name=None):
     # Credentials are stored as an environment variable on Render (see deployment steps)
     creds_json = os.environ["GOOGLE_CREDENTIALS_JSON"]
     creds_dict = json.loads(creds_json)
@@ -34,7 +35,7 @@ def get_sheet():
     client = gspread.authorize(creds)
 
     spreadsheet_id = os.environ["SPREADSHEET_ID"]
-    sheet_name = os.environ.get("SHEET_NAME", "Subscribers")
+    sheet_name = sheet_name or os.environ.get("SHEET_NAME", "Subscribers")
     return client.open_by_key(spreadsheet_id).worksheet(sheet_name)
 
 
@@ -112,6 +113,46 @@ def get_authenticated_email():
         del SESSION_TOKENS[token]
         return None
     return entry["email"]
+
+
+@app.route("/sponsor-click")
+def sponsor_click():
+    """Click-tracking redirect for the newsletter's sponsor slot. Takes only
+    a row number — never a URL — and looks the destination up itself from the
+    Sponsors sheet. This is deliberate: accepting an arbitrary URL in the
+    query string would make this an open redirect (anyone could craft a link
+    using our domain to send people to a phishing site). Sourcing the
+    destination from our own trusted sheet data closes that off entirely."""
+    row_param = request.args.get("row", "").strip()
+    if not row_param.isdigit():
+        return jsonify({"error": "Invalid request"}), 400
+    row_num = int(row_param)
+
+    try:
+        sheet = get_sheet(SPONSOR_SHEET_NAME)
+        headers = sheet.row_values(1)
+        row_values = sheet.row_values(row_num)
+        record = dict(zip(headers, row_values))
+        dest = (record.get("LinkURL") or "").strip()
+
+        if not (dest.startswith("http://") or dest.startswith("https://")):
+            return jsonify({"error": "Sponsor link not configured"}), 404
+
+        # Best-effort click counter — never let a tracking failure block the
+        # actual redirect the person is waiting on.
+        try:
+            if "Clicks" in headers:
+                clicks_col = headers.index("Clicks") + 1
+                current = record.get("Clicks", "")
+                current_num = int(current) if str(current).strip().isdigit() else 0
+                sheet.update_cell(row_num, clicks_col, current_num + 1)
+        except Exception as e:
+            print("Sponsor click counter update failed:", e)
+
+        return redirect(dest, code=302)
+    except Exception as e:
+        print("Sponsor click error:", e)
+        return jsonify({"error": "Could not process sponsor link"}), 500
 
 
 @app.route("/")

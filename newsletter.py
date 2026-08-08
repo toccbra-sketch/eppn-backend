@@ -259,6 +259,69 @@ STYLE_HINTS = [
     "Open by framing the size of today's move (small/moderate/large relative to typical daily swings), then get to what's next.",
 ]
 
+# This block is IDENTICAL on every single call, regardless of ticker, asset
+# type, or style variation — that's deliberate, so it can be marked
+# cacheable. Ticker-specific data (price, headline, earnings, asset type,
+# style hint) all live in the per-call dynamic block below instead, so they
+# never invalidate the cache. Anthropic's prompt caching charges a ~25%
+# premium on the first call that writes the cache, but only ~10% of normal
+# input price on every subsequent call within the cache window (5 min) that
+# reuses it — a net win as soon as a run generates more than one blurb.
+STATIC_BLURB_INSTRUCTIONS = """You are writing content for an educational investing newsletter. You'll be given data about one ticker below, and must produce a headline and a short educational paragraph about it.
+
+Produce TWO things:
+1. A short, catchy, punny/playful headline (max 8 words) related to the news, price move, or
+   upcoming date given below — think newspaper-style wordplay tied to the company/fund or what's
+   happening (e.g. for a rocket company having a good day: "SpaceX Shoots for the Moon").
+   The headline must NOT imply the reader should buy, sell, or take any action.
+2. A brief paragraph (2-3 sentences) that prioritizes FORWARD-LOOKING, factual information —
+   readers want to know what's coming up and what could move the price next, not just what already
+   happened. Follow this priority order:
+   a) If there's an upcoming earnings date given below, LEAD with it — state the date (and timing,
+      if known) plainly. This is the single most useful thing you can tell a reader holding this stock.
+   b) If there are upcoming macro events given below (for funds/ETFs), lead with those instead —
+      funds don't have their own earnings, so Fed decisions, inflation data, and jobs reports are
+      the equivalent "what's coming up" information for them.
+   c) Read the "Recent headline" given below carefully for any OTHER concrete, forward-looking catalyst
+      it mentions or implies — e.g. a pending FDA decision, a scheduled court ruling, a merger vote
+      date, a product launch, a regulatory deadline. If one is there, surface it plainly, since
+      this is exactly the kind of thing that can move the price and readers want to know about it.
+   d) Only if there is genuinely nothing forward-looking to report from (a)-(c), fall back to a
+      short neutral note on what historically tends to follow this kind of move — this is the
+      last resort, not the default.
+   Never predict which way the price will move because of any of the above. State facts and known
+   dates, not forecasts.
+   IMPORTANT: If there is NO upcoming earnings date and NO upcoming macro event, do not mention
+   that fact at all — never write things like "no earnings are scheduled this week" or "X doesn't
+   report until next quarter." Absence of an event is not itself newsworthy; it's just filler.
+   Simply skip straight to (c) or (d) as if earnings/macro events were never brought up.
+
+READABILITY — this is written for everyday personal investors, not finance professionals. Follow these
+rules strictly:
+- Use short, simple sentences. One idea per sentence.
+- Avoid financial jargon (e.g. don't say "volatility," "momentum," "valuation multiples," "market cap
+  compression" — say things like "the price swung a lot" or "investors reacted quickly" instead).
+- If a technical term is genuinely necessary, briefly explain it in plain words right there.
+- Write like you're explaining it to a smart friend who doesn't follow the stock market closely —
+  clear and conversational, not textbook or press-release toned.
+- Prefer concrete, everyday comparisons over abstract financial concepts.
+
+STRICT RULES — these are non-negotiable, for BOTH the headline and paragraph:
+- Do NOT use the words "buy," "sell," "hold," or any variation telling the reader what to do.
+- Do NOT recommend, suggest, or imply any action the reader should take.
+- Do NOT say things like "good time to," "bad time to," "worth considering," or similar action-nudging phrases.
+- Do NOT predict future price direction ("will likely rise/fall") — stating a known upcoming date or
+  event (like an earnings date or FDA decision date) is fine; guessing what happens to the price
+  because of it is not.
+- Do not invent a catalyst that isn't actually in the headline/data below — only surface what's
+  genuinely there.
+- Do not add a disclaimer sentence — one is added separately in the email template.
+
+Vary sentence openings and structure across different tickers so this doesn't read like a template
+repeated for every stock. Avoid starting with the word "Historically."
+
+Call the submit_blurb tool with your headline and body."""
+
 
 def generate_blurb(snapshot, variation_index=0):
     """Ask Claude for a catchy headline + short educational blurb. Never buy/sell language.
@@ -302,9 +365,7 @@ def generate_blurb(snapshot, variation_index=0):
         )
         macro_line = f"Upcoming macro events (relevant to broad-market funds): {events_desc}."
 
-    prompt = f"""You are writing content for an educational investing newsletter, covering one ticker.
-
-Ticker: {snapshot['ticker']}
+    dynamic_data = f"""Ticker: {snapshot['ticker']}
 {asset_type_note}
 Current price: ${snapshot['price']}
 Change since last close: {snapshot['pct_change']}%
@@ -312,59 +373,7 @@ Recent headline: {snapshot['headline'] or 'No major headline today'}
 {earnings_line}
 {macro_line}
 
-Produce TWO things:
-1. A short, catchy, punny/playful headline (max 8 words) related to the news, price move, or
-   upcoming date above — think newspaper-style wordplay tied to the company/fund or what's happening
-   (e.g. for a rocket company having a good day: "SpaceX Shoots for the Moon").
-   The headline must NOT imply the reader should buy, sell, or take any action.
-2. A brief paragraph (2-3 sentences) that prioritizes FORWARD-LOOKING, factual information —
-   readers want to know what's coming up and what could move the price next, not just what already
-   happened. Follow this priority order:
-   a) If there's an upcoming earnings date listed above, LEAD with it — state the date (and timing,
-      if known) plainly. This is the single most useful thing you can tell a reader holding this stock.
-   b) If there are upcoming macro events listed above (for funds/ETFs), lead with those instead —
-      funds don't have their own earnings, so Fed decisions, inflation data, and jobs reports are
-      the equivalent "what's coming up" information for them.
-   c) Read the "Recent headline" carefully for any OTHER concrete, forward-looking catalyst it
-      mentions or implies — e.g. a pending FDA decision, a scheduled court ruling, a merger vote
-      date, a product launch, a regulatory deadline. If one is there, surface it plainly, since
-      this is exactly the kind of thing that can move the price and readers want to know about it.
-   d) Only if there is genuinely nothing forward-looking to report from (a)-(c), fall back to a
-      short neutral note on what historically tends to follow this kind of move — this is the
-      last resort, not the default.
-   Never predict which way the price will move because of any of the above. State facts and known
-   dates, not forecasts.
-   IMPORTANT: If there is NO upcoming earnings date and NO upcoming macro event, do not mention
-   that fact at all — never write things like "no earnings are scheduled this week" or "X doesn't
-   report until next quarter." Absence of an event is not itself newsworthy; it's just filler.
-   Simply skip straight to (c) or (d) as if earnings/macro events were never brought up.
-
-READABILITY — this is written for everyday personal investors, not finance professionals. Follow these
-rules strictly:
-- Use short, simple sentences. One idea per sentence.
-- Avoid financial jargon (e.g. don't say "volatility," "momentum," "valuation multiples," "market cap
-  compression" — say things like "the price swung a lot" or "investors reacted quickly" instead).
-- If a technical term is genuinely necessary, briefly explain it in plain words right there.
-- Write like you're explaining it to a smart friend who doesn't follow the stock market closely —
-  clear and conversational, not textbook or press-release toned.
-- Prefer concrete, everyday comparisons over abstract financial concepts.
-
-STYLE: {style_hint} Avoid starting with the word "Historically" — vary sentence openings
-and structure so this doesn't read like a template repeated for every stock. Keep the actual information
-(price move, upcoming dates, catalysts) the same regardless of phrasing style.
-
-STRICT RULES — these are non-negotiable, for BOTH the headline and paragraph:
-- Do NOT use the words "buy," "sell," "hold," or any variation telling the reader what to do.
-- Do NOT recommend, suggest, or imply any action the reader should take.
-- Do NOT say things like "good time to," "bad time to," "worth considering," or similar action-nudging phrases.
-- Do NOT predict future price direction ("will likely rise/fall") — stating a known upcoming date or
-  event (like an earnings date or FDA decision date) is fine; guessing what happens to the price
-  because of it is not.
-- Do not invent a catalyst that isn't actually in the headline/data above — only surface what's
-  genuinely there.
-- Do not add a disclaimer sentence — one is added separately in the email template.
-
-Call the submit_blurb tool with your headline and body."""
+STYLE for this one: {style_hint}"""
 
     fallback = {
         "headline": f"{snapshot['ticker']} Update",
@@ -395,7 +404,20 @@ Call the submit_blurb tool with your headline and body."""
                 },
             }],
             tool_choice={"type": "tool", "name": "submit_blurb"},
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": STATIC_BLURB_INSTRUCTIONS,
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                    {
+                        "type": "text",
+                        "text": dynamic_data,
+                    },
+                ],
+            }]
         )
 
         tool_use_block = next(

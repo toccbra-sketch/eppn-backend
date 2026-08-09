@@ -50,6 +50,25 @@ def find_subscriber_row(email):
     return None, None
 
 
+def find_subscriber_by_referral_code(code):
+    """Returns (row_number, row_dict) for whoever owns this referral code, or
+    (None, None) if it doesn't match anyone — an invalid/unknown code is not
+    an error, it just means no one gets credited."""
+    sheet = get_sheet()
+    records = sheet.get_all_records()
+    code_clean = code.strip()
+    for i, record in enumerate(records, start=2):
+        if str(record.get("ReferralCode", "")).strip() == code_clean:
+            return i, record
+    return None, None
+
+
+def generate_referral_code():
+    # 8 hex chars — short enough to type/paste, plenty of headroom against
+    # collisions at this scale (4+ billion possible codes).
+    return secrets.token_hex(4)
+
+
 def send_plain_email(to_email, subject, body_text, reply_to=None):
     print(f"[send_plain_email] sending via Brevo API to {to_email}...")
     payload = {
@@ -330,13 +349,46 @@ def subscribe():
     email = (data.get("email") or "").strip()
     portfolio = (data.get("portfolio") or "").strip()
     status = data.get("status", "active")
+    referred_by_code = (data.get("referredBy") or "").strip()
 
     if not name or not email or not portfolio:
         return jsonify({"error": "Missing required fields"}), 400
 
+    own_referral_code = generate_referral_code()
+
     try:
         sheet = get_sheet()
-        sheet.append_row([name, email, portfolio, status])
+        headers = sheet.row_values(1)
+
+        # Build the new row by actual header order rather than a hardcoded
+        # position list — this way it doesn't matter what order ReferralCode/
+        # ReferralCount end up in relative to the original four columns, as
+        # long as the header names match.
+        values_by_header = {
+            "Name": name,
+            "Email": email,
+            "Portfolio": portfolio,
+            "Status": status,
+            "ReferralCode": own_referral_code,
+            "ReferralCount": 0,
+        }
+        row = [values_by_header.get(h, "") for h in headers]
+        sheet.append_row(row)
+
+        # Credit whoever referred this new subscriber, if the code is valid.
+        # An invalid/unknown code is never an error — subscribing still
+        # succeeds either way, it just doesn't credit anyone.
+        if referred_by_code:
+            try:
+                referrer_row, referrer_record = find_subscriber_by_referral_code(referred_by_code)
+                if referrer_row and "ReferralCount" in headers:
+                    count_col = headers.index("ReferralCount") + 1
+                    current = referrer_record.get("ReferralCount", 0)
+                    current_num = int(current) if str(current).strip().isdigit() else 0
+                    sheet.update_cell(referrer_row, count_col, current_num + 1)
+            except Exception as e:
+                print("Referral credit failed (subscribe still succeeded):", e)
+
     except Exception as e:
         print("Error writing to sheet:", e)
         return jsonify({"error": "Could not save subscriber"}), 500
@@ -474,21 +526,43 @@ def logout():
 
 @app.route("/get-portfolio")
 def get_portfolio():
-    """Returns the logged-in subscriber's current name/portfolio/status."""
+    """Returns the logged-in subscriber's current name/portfolio/status,
+    plus their referral code and count."""
     email = get_authenticated_email()
     if not email:
         return jsonify({"error": "Not authenticated. Please log in again."}), 401
 
     try:
-        _, record = find_subscriber_row(email)
+        row_num, record = find_subscriber_row(email)
         if not record:
             return jsonify({"error": "No subscriber found for this email"}), 404
+
+        referral_code = str(record.get("ReferralCode", "")).strip()
+        referral_count_raw = record.get("ReferralCount", 0)
+        referral_count = int(referral_count_raw) if str(referral_count_raw).strip().isdigit() else 0
+
+        # Subscribers who signed up before this feature existed won't have a
+        # code yet — generate and save one the first time we see them here,
+        # so every subscriber ends up with one without needing a manual
+        # backfill. Fails silently (just omits the code) if the sheet
+        # doesn't have a ReferralCode column at all yet.
+        if not referral_code:
+            try:
+                sheet = get_sheet()
+                headers = sheet.row_values(1)
+                if "ReferralCode" in headers:
+                    referral_code = generate_referral_code()
+                    sheet.update_cell(row_num, headers.index("ReferralCode") + 1, referral_code)
+            except Exception as e:
+                print("Could not backfill referral code:", e)
 
         return jsonify({
             "name": record.get("Name", ""),
             "email": record.get("Email", ""),
             "portfolio": record.get("Portfolio", ""),
             "status": record.get("Status", ""),
+            "referralCode": referral_code,
+            "referralCount": referral_count,
         })
     except Exception as e:
         print("Get portfolio error:", e)

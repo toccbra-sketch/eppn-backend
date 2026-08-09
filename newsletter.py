@@ -457,7 +457,7 @@ STYLE for this one: {style_hint}"""
     return {"headline": headline, "body": body}
 
 
-def build_email_html(name, stock_sections, sponsor=None):
+def build_email_html(name, stock_sections, sponsor=None, referral_count=0):
     # Colors matched to eppn-common.css so the email looks like an extension
     # of the site rather than a separate, older-looking product.
     NAVY_900 = "#0a1930"
@@ -575,8 +575,11 @@ def build_email_html(name, stock_sections, sponsor=None):
               <a href="{SITE_BASE}/privacy-policy.html" style="color:{NAVY_700};">Privacy Policy</a> &nbsp;|&nbsp;
               <a href="{SITE_BASE}/terms.html" style="color:{NAVY_700};">Terms of Service</a>
             </p>
-            <p style="font-family:Arial,sans-serif; font-size:11px; color:#aaa; margin:0;">
+            <p style="font-family:Arial,sans-serif; font-size:11px; color:#aaa; margin:0 0 10px;">
               [Your business mailing address here — required by the CAN-SPAM Act for commercial email]
+            </p>
+            <p style="text-align:center; font-family:Arial,sans-serif; font-size:12px; color:{MUTED}; margin:0;">
+              <a href="{SITE_BASE}/referrals.html" style="color:{MUTED}; text-decoration:underline;">Your Referrals: <strong style="color:{NAVY_900};">{referral_count}</strong></a>
             </p>
           </td></tr>
         </table>
@@ -654,6 +657,8 @@ def main():
         name = sub.get("Name", "there")
         email = sub.get("Email")
         portfolio = [t.strip().upper() for t in sub.get("Portfolio", "").split(",") if t.strip()]
+        referral_count_raw = sub.get("ReferralCount", 0)
+        referral_count = int(referral_count_raw) if str(referral_count_raw).strip().isdigit() else 0
 
         if not email or not portfolio:
             continue
@@ -675,7 +680,7 @@ def main():
             print(f"No valid stock data for {email}, skipping")
             continue
 
-        html = build_email_html(name, stock_sections, sponsor=sponsor)
+        html = build_email_html(name, stock_sections, sponsor=sponsor, referral_count=referral_count)
         try:
             send_email(email, "Your daily portfolio update — The Portfolio Briefcase", html)
             print(f"Sent to {email}")

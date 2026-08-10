@@ -26,6 +26,11 @@ BREVO_API_KEY = os.environ["BREVO_API_KEY"]
 EMAIL_ADDRESS = os.environ["EMAIL_ADDRESS"]  # must be a verified sender in Brevo
 SENDER_NAME = os.environ.get("SENDER_NAME", "The Portfolio Briefcase")
 
+# Shared secret protecting the /admin/stats endpoint — set this to a long
+# random string in Render's environment variables. Not tied to the
+# subscriber login system on purpose; this is an owner-only tool.
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+
 
 def get_sheet(sheet_name=None):
     # Credentials are stored as an environment variable on Render (see deployment steps)
@@ -172,6 +177,87 @@ def sponsor_click():
     except Exception as e:
         print("Sponsor click error:", e)
         return jsonify({"error": "Could not process sponsor link"}), 500
+
+
+@app.route("/admin/stats")
+def admin_stats():
+    """Owner-only dashboard data: subscriber counts, referral totals, and
+    newsletter open/click rates from Brevo. Protected by a shared secret
+    (X-Admin-Key header) rather than the subscriber login system, since this
+    isn't a subscriber-facing feature. Each section is independent — if one
+    part fails (e.g. Sponsors tab missing, Brevo request fails), the rest of
+    the stats still come back rather than the whole endpoint erroring out."""
+    provided_key = request.headers.get("X-Admin-Key", "")
+    if not ADMIN_KEY or not secrets.compare_digest(provided_key, ADMIN_KEY):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    stats = {}
+
+    # --- Subscriber counts + referral totals, from the Subscribers sheet ---
+    try:
+        sheet = get_sheet()
+        records = sheet.get_all_records()
+        active = [r for r in records if str(r.get("Status", "")).lower() == "active"]
+        inactive = [r for r in records if str(r.get("Status", "")).lower() != "active"]
+        total_referrals = sum(
+            int(r.get("ReferralCount", 0)) if str(r.get("ReferralCount", "")).strip().isdigit() else 0
+            for r in records
+        )
+        top_referrer = max(
+            records,
+            key=lambda r: int(r.get("ReferralCount", 0)) if str(r.get("ReferralCount", "")).strip().isdigit() else 0,
+            default=None,
+        )
+        stats["subscribers"] = {
+            "total": len(records),
+            "active": len(active),
+            "inactive": len(inactive),
+            "total_referrals": total_referrals,
+            "top_referrer_name": top_referrer.get("Name", "") if top_referrer and total_referrals > 0 else None,
+        }
+    except Exception as e:
+        print("Admin stats: subscriber count failed:", e)
+        stats["subscribers"] = None
+
+    # --- Sponsor click totals, from the Sponsors sheet (optional — may not exist yet) ---
+    try:
+        sponsor_sheet = get_sheet(SPONSOR_SHEET_NAME)
+        sponsor_records = sponsor_sheet.get_all_records()
+        total_clicks = sum(
+            int(r.get("Clicks", 0)) if str(r.get("Clicks", "")).strip().isdigit() else 0
+            for r in sponsor_records
+        )
+        stats["sponsor_clicks"] = total_clicks
+    except Exception as e:
+        print("Admin stats: sponsor clicks failed (tab may not exist yet):", e)
+        stats["sponsor_clicks"] = None
+
+    # --- Newsletter open/click rates from Brevo, last 30 days, newsletter-tagged sends only ---
+    try:
+        resp = requests.get(
+            "https://api.brevo.com/v3/smtp/statistics/aggregatedReport",
+            headers={"api-key": BREVO_API_KEY, "Accept": "application/json"},
+            params={"days": 30, "tag": "newsletter"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        report = resp.json()
+        delivered = report.get("delivered", 0)
+        unique_opens = report.get("uniqueOpens", 0)
+        unique_clicks = report.get("uniqueClicks", 0)
+        stats["email_performance"] = {
+            "period_days": 30,
+            "delivered": delivered,
+            "unique_opens": unique_opens,
+            "unique_clicks": unique_clicks,
+            "open_rate_pct": round(unique_opens / delivered * 100, 1) if delivered else None,
+            "click_rate_pct": round(unique_clicks / delivered * 100, 1) if delivered else None,
+        }
+    except Exception as e:
+        print("Admin stats: Brevo stats failed:", e)
+        stats["email_performance"] = None
+
+    return jsonify(stats), 200
 
 
 @app.route("/")

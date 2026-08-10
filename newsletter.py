@@ -604,6 +604,10 @@ def send_email(to_email, subject, html_body):
             "to": [{"email": to_email}],
             "subject": subject,
             "htmlContent": html_body,
+            # Tagged so Brevo's stats can be filtered to newsletter sends only,
+            # separate from login-code and feedback emails sent from app.py —
+            # otherwise open/click rates would be diluted by unrelated mail.
+            "tags": ["newsletter"],
         },
         timeout=15,
     )

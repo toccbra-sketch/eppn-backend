@@ -16,6 +16,13 @@ SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 SHEET_NAME = os.environ.get("SHEET_NAME", "Subscribers")
 SPONSOR_SHEET_NAME = os.environ.get("SPONSOR_SHEET_NAME", "Sponsors")
 
+# SEC EDGAR requires a descriptive User-Agent identifying the requester (their
+# fair-access policy) — no API key needed, it's a free public API, but requests
+# without a real User-Agent get rate-limited/blocked.
+SEC_USER_AGENT = os.environ.get(
+    "SEC_USER_AGENT", "The Portfolio Briefcase contact@theportfoliobriefcase.com"
+)
+
 # --- Brevo (email API) setup ---
 # Same reasoning as app.py: sending via Brevo's HTTPS API instead of raw SMTP
 # means we can send from a real domain address (contact@theportfoliobriefcase.com)
@@ -165,8 +172,79 @@ def get_macro_events(days_ahead=5):
     return [{"event": "Fed interest rate decision", "time": upcoming[0]}]
 
 
+
+# SEC EDGAR's ticker-to-CIK mapping is a single free JSON file, refreshed by
+# the SEC periodically. We fetch it once per run and cache it in memory —
+# every ticker lookup afterward is just a dict access, no extra network calls.
+_CIK_MAP_CACHE = None
+
+# Filing types worth surfacing to a reader who isn't a securities lawyer.
+# 8-K = "something material just happened" (earnings, executive changes, M&A,
+#   bankruptcy, etc.) — the single most useful forward-looking filing type.
+# 10-Q/10-K = quarterly/annual report (usually coincides with earnings).
+# DEF 14A = proxy statement, usually means a shareholder vote/meeting is coming.
+# S-1/S-3/424B = new stock or bond offering being registered.
+RELEVANT_FORMS = {"8-K", "10-Q", "10-K", "DEF 14A", "S-1", "S-3", "424B5", "424B4"}
+
+
+def _get_cik_map():
+    global _CIK_MAP_CACHE
+    if _CIK_MAP_CACHE is not None:
+        return _CIK_MAP_CACHE
+    try:
+        resp = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers={"User-Agent": SEC_USER_AGENT},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # File is shaped like {"0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}, ...}
+        _CIK_MAP_CACHE = {
+            row["ticker"].upper(): str(row["cik_str"]).zfill(10)
+            for row in data.values()
+        }
+    except Exception as e:
+        print(f"Could not load SEC ticker->CIK map, filings lookup will be skipped: {e}")
+        _CIK_MAP_CACHE = {}
+    return _CIK_MAP_CACHE
+
+
+def get_sec_filings(ticker, days_back=10):
+    """Looks up the most recent notable SEC filing (8-K, 10-Q, 10-K, DEF 14A,
+    or an offering-related form) for a ticker within the last `days_back` days.
+    Returns {"form": "8-K", "date": "2026-08-05"} or None. ETFs, crypto, and
+    tickers with no CIK match (funds mostly don't file this way) safely
+    return None — this only applies to individual companies."""
+    from datetime import date, timedelta
+
+    cik = _get_cik_map().get(ticker.upper())
+    if not cik:
+        return None
+
+    try:
+        resp = requests.get(
+            f"https://data.sec.gov/submissions/CIK{cik}.json",
+            headers={"User-Agent": SEC_USER_AGENT},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        recent = resp.json().get("filings", {}).get("recent", {})
+        forms = recent.get("form", [])
+        dates = recent.get("filingDate", [])
+
+        cutoff = (date.today() - timedelta(days=days_back)).isoformat()
+        for form, filed in zip(forms, dates):
+            if form in RELEVANT_FORMS and filed >= cutoff:
+                return {"form": form, "date": filed}
+        return None
+    except Exception as e:
+        print(f"SEC filings lookup failed for {ticker}: {e}")
+        return None
+
+
 def get_stock_snapshot(ticker, macro_events=None, max_retries=3):
-    """Pull current price + % change + a recent headline for one ticker via Finnhub."""
+    """Pull current price + a recent headline for one ticker via Finnhub."""
     for attempt in range(1, max_retries + 1):
         try:
             quote_resp = requests.get(
@@ -208,10 +286,11 @@ def get_stock_snapshot(ticker, macro_events=None, max_retries=3):
             return {
                 "ticker": ticker,
                 "price": round(current_price, 2),
-                "pct_change": round(pct_change, 2),
+                "pct_change": round(pct_change, 2),  # kept internally for style-hint variation only, not displayed
                 "headline": headline,
                 "earnings": get_upcoming_earnings(ticker),
                 "macro_events": (macro_events or []) if ticker in KNOWN_FUNDS else [],
+                "sec_filing": None if ticker in KNOWN_FUNDS or ":" in ticker else get_sec_filings(ticker),
             }
         except Exception as e:
             print(f"Attempt {attempt}/{max_retries} failed for {ticker}: {e}")
@@ -267,60 +346,61 @@ STYLE_HINTS = [
 # premium on the first call that writes the cache, but only ~10% of normal
 # input price on every subsequent call within the cache window (5 min) that
 # reuses it — a net win as soon as a run generates more than one blurb.
-STATIC_BLURB_INSTRUCTIONS = """You are writing content for an educational investing newsletter. You'll be given data about one ticker below, and must produce a headline and a short educational paragraph about it.
+STATIC_BLURB_INSTRUCTIONS = """You are writing content for an educational investing newsletter. You'll be given data about one ticker below, and must produce a headline and a short list of simple, readable bullet points about it.
 
 Produce TWO things:
-1. A short, catchy, punny/playful headline (max 8 words) related to the news, price move, or
-   upcoming date given below — think newspaper-style wordplay tied to the company/fund or what's
-   happening (e.g. for a rocket company having a good day: "SpaceX Shoots for the Moon").
-   The headline must NOT imply the reader should buy, sell, or take any action.
-2. A brief paragraph (2-3 sentences) that prioritizes FORWARD-LOOKING, factual information —
-   readers want to know what's coming up and what could move the price next, not just what already
-   happened. Follow this priority order:
-   a) If there's an upcoming earnings date given below, LEAD with it — state the date (and timing,
-      if known) plainly. This is the single most useful thing you can tell a reader holding this stock.
-   b) If there are upcoming macro events given below (for funds/ETFs), lead with those instead —
-      funds don't have their own earnings, so Fed decisions, inflation data, and jobs reports are
-      the equivalent "what's coming up" information for them.
-   c) Read the "Recent headline" given below carefully for any OTHER concrete, forward-looking catalyst
-      it mentions or implies — e.g. a pending FDA decision, a scheduled court ruling, a merger vote
-      date, a product launch, a regulatory deadline. If one is there, surface it plainly, since
-      this is exactly the kind of thing that can move the price and readers want to know about it.
-   d) Only if there is genuinely nothing forward-looking to report from (a)-(c), fall back to a
-      short neutral note on what historically tends to follow this kind of move — this is the
-      last resort, not the default.
-   Never predict which way the price will move because of any of the above. State facts and known
-   dates, not forecasts.
-   IMPORTANT: If there is NO upcoming earnings date and NO upcoming macro event, do not mention
-   that fact at all — never write things like "no earnings are scheduled this week" or "X doesn't
-   report until next quarter." Absence of an event is not itself newsworthy; it's just filler.
-   Simply skip straight to (c) or (d) as if earnings/macro events were never brought up.
+1. A short, catchy, punny/playful headline (max 8 words) related to the news or upcoming date given
+   below — think newspaper-style wordplay tied to the company/fund or what's happening (e.g. for a
+   rocket company with a pending launch: "SpaceX Counts Down to Launch Day").
+   The headline must NOT imply the reader should buy, sell, or take any action, and must NOT be
+   about today's price move — focus it on what's coming up instead.
+2. Between 2 and 4 short bullet points, each ONE sentence, covering what's coming up and what could
+   matter next for this holding — NOT a recap of today's price action. This reader already sees the
+   price elsewhere; they want to know what's ahead. Pull bullets from whatever is available below,
+   in this priority order, and SKIP any category that has no data rather than writing a filler bullet:
+   a) Upcoming earnings date, if given — state the date (and timing, if known) plainly.
+   b) Upcoming macro/Fed events, if given (mainly for funds/ETFs) — state the event and date plainly.
+   c) A recent SEC filing, if given — briefly say what it is in plain English (e.g. an "8-K" is
+      "a filing disclosing a major company event," a "DEF 14A" is "a notice for an upcoming
+      shareholder vote," a "10-Q"/"10-K" is "a quarterly/annual financial report") and its date.
+   d) Read the "Recent headline" below for any OTHER concrete, forward-looking angle it mentions or
+      implies — a pending FDA decision, a scheduled court ruling, a merger vote, a product launch, a
+      world/economic event that could affect this holding (trade policy, geopolitical developments,
+      commodity prices, interest rates, etc.). If there's a real forward-looking angle in it, write
+      a bullet about that angle — not a recap of the headline as old news.
+   e) Only if there is genuinely nothing forward-looking available from (a)-(d), include ONE bullet
+      with a brief, neutral factual note about the holding (e.g. its sector or role in a portfolio)
+      instead of discussing the price move. Never fall back to describing today's price change.
+   Never predict which way the price will move. State facts and known dates, not forecasts.
+   IMPORTANT: If a category has no data, just omit it — never write things like "no earnings are
+   scheduled" or "no filings were found." Absence of an event is not newsworthy; skip it silently.
 
 READABILITY — this is written for everyday personal investors, not finance professionals. Follow these
 rules strictly:
-- Use short, simple sentences. One idea per sentence.
+- Each bullet is ONE short, simple sentence. One idea per bullet, no run-ons.
 - Avoid financial jargon (e.g. don't say "volatility," "momentum," "valuation multiples," "market cap
   compression" — say things like "the price swung a lot" or "investors reacted quickly" instead).
-- If a technical term is genuinely necessary, briefly explain it in plain words right there.
+- If a technical term is genuinely necessary (like a filing type), briefly explain it in plain words
+  right there in the same bullet.
 - Write like you're explaining it to a smart friend who doesn't follow the stock market closely —
   clear and conversational, not textbook or press-release toned.
-- Prefer concrete, everyday comparisons over abstract financial concepts.
+- Do NOT mention specific price levels or percentage changes anywhere in the bullets.
 
-STRICT RULES — these are non-negotiable, for BOTH the headline and paragraph:
+STRICT RULES — these are non-negotiable, for BOTH the headline and bullets:
 - Do NOT use the words "buy," "sell," "hold," or any variation telling the reader what to do.
 - Do NOT recommend, suggest, or imply any action the reader should take.
 - Do NOT say things like "good time to," "bad time to," "worth considering," or similar action-nudging phrases.
 - Do NOT predict future price direction ("will likely rise/fall") — stating a known upcoming date or
   event (like an earnings date or FDA decision date) is fine; guessing what happens to the price
   because of it is not.
-- Do not invent a catalyst that isn't actually in the headline/data below — only surface what's
-  genuinely there.
+- Do not invent a catalyst, filing, or event that isn't actually in the data below — only surface
+  what's genuinely there.
 - Do not add a disclaimer sentence — one is added separately in the email template.
 
 Vary sentence openings and structure across different tickers so this doesn't read like a template
 repeated for every stock. Avoid starting with the word "Historically."
 
-Call the submit_blurb tool with your headline and body."""
+Call the submit_blurb tool with your headline and bullets."""
 
 
 def generate_blurb(snapshot, variation_index=0):
@@ -355,7 +435,7 @@ def generate_blurb(snapshot, variation_index=0):
         timing_str = f" ({e['timing']})" if e["timing"] else ""
         earnings_line = f"Upcoming earnings: reports on {e['date']}{timing_str}."
     else:
-        earnings_line = "Upcoming earnings: none scheduled in the next 7 days."
+        earnings_line = ""
 
     macro_line = ""
     if snapshot.get("macro_events"):
@@ -365,29 +445,32 @@ def generate_blurb(snapshot, variation_index=0):
         )
         macro_line = f"Upcoming macro events (relevant to broad-market funds): {events_desc}."
 
+    filing_line = ""
+    if snapshot.get("sec_filing"):
+        f = snapshot["sec_filing"]
+        filing_line = f"Recent SEC filing: form {f['form']} filed on {f['date']}."
+
     dynamic_data = f"""Ticker: {snapshot['ticker']}
 {asset_type_note}
-Current price: ${snapshot['price']}
-Change since last close: {snapshot['pct_change']}%
 Recent headline: {snapshot['headline'] or 'No major headline today'}
 {earnings_line}
 {macro_line}
+{filing_line}
 
 STYLE for this one: {style_hint}"""
 
     fallback = {
         "headline": f"{snapshot['ticker']} Update",
-        "body": (f"{snapshot['ticker']} moved {snapshot['pct_change']}% today. "
-                 f"(Trend note unavailable for this update.)")
+        "bullets": [f"No major forward-looking news found for {snapshot['ticker']} today — check back tomorrow for updates."]
     }
 
     try:
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=300,
+            max_tokens=350,
             tools=[{
                 "name": "submit_blurb",
-                "description": "Submit the generated headline and body for this ticker.",
+                "description": "Submit the generated headline and bullet points for this ticker.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -395,12 +478,15 @@ STYLE for this one: {style_hint}"""
                             "type": "string",
                             "description": "Short punny headline, max 8 words.",
                         },
-                        "body": {
-                            "type": "string",
-                            "description": "2-3 sentence paragraph following the priority order and rules above.",
+                        "bullets": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": 4,
+                            "description": "2-4 short, one-sentence bullet points following the priority order and rules above.",
                         },
                     },
-                    "required": ["headline", "body"],
+                    "required": ["headline", "bullets"],
                 },
             }],
             tool_choice={"type": "tool", "name": "submit_blurb"},
@@ -428,10 +514,10 @@ STYLE for this one: {style_hint}"""
             raise ValueError("No tool_use block in response")
 
         headline = str(tool_use_block.input.get("headline", "")).strip()
-        body = str(tool_use_block.input.get("body", "")).strip()
+        bullets = [str(b).strip() for b in tool_use_block.input.get("bullets", []) if str(b).strip()]
 
-        if not headline or not body:
-            raise ValueError("Missing headline or body in response")
+        if not headline or not bullets:
+            raise ValueError("Missing headline or bullets in response")
 
     except Exception as e:
         print(f"Claude call/parse failed for {snapshot['ticker']}: {e}")
@@ -441,20 +527,16 @@ STYLE for this one: {style_hint}"""
     # Uses word-boundary matching, not raw substring matching — otherwise "hold"
     # would false-positive on completely innocent words like "holds", "holdings",
     # or "shareholders", which are normal, safe things to say about a fund.
-    combined_lowered = (headline + " " + body).lower()
+    combined_lowered = (headline + " " + " ".join(bullets)).lower()
     flagged = any(
         re.search(r'\b' + re.escape(phrase) + r'\b', combined_lowered)
         for phrase in FORBIDDEN_PHRASES
     )
     if flagged:
         print(f"WARNING: content for {snapshot['ticker']} contained flagged language, using fallback text")
-        return {
-            "headline": f"{snapshot['ticker']} Update",
-            "body": (f"{snapshot['ticker']} moved {snapshot['pct_change']}% following recent news. "
-                     f"No further trend detail available for this update.")
-        }
+        return fallback
 
-    return {"headline": headline, "body": body}
+    return {"headline": headline, "bullets": bullets}
 
 
 def build_email_html(name, stock_sections, sponsor=None, referral_count=0):
@@ -462,8 +544,6 @@ def build_email_html(name, stock_sections, sponsor=None, referral_count=0):
     # of the site rather than a separate, older-looking product.
     NAVY_900 = "#0a1930"
     NAVY_700 = "#17365f"
-    UP = "#1e6b45"
-    DOWN = "#a13d2e"
     MUTED = "#667085"
     BORDER = "#dcdfe4"
     PAPER = "#f6f5f1"
@@ -473,23 +553,24 @@ def build_email_html(name, stock_sections, sponsor=None, referral_count=0):
 
     sections_html = ""
     for s in stock_sections:
-        is_up = s["pct_change"] >= 0
-        arrow = "▲" if is_up else "▼"
-        color = UP if is_up else DOWN
         headline = s["blurb"]["headline"]
-        body = s["blurb"]["body"]
+        bullets = s["blurb"]["bullets"]
         # Display-friendly ticker: strip exchange prefix for crypto (e.g.
         # "BINANCE:BTCUSDT" shows as "BTCUSDT") so it doesn't look technical.
         display_ticker = s['ticker'].split(":")[-1] if ":" in s['ticker'] else s['ticker']
+        bullets_html = "".join(
+            f'<li style="font-family:Arial,sans-serif; font-size:14px; color:#333; line-height:1.6; margin-bottom:4px;">{b}</li>'
+            for b in bullets
+        )
         sections_html += f"""
         <tr><td style="padding:0 0 12px;">
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {BORDER}; border-radius:6px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {BORDER}; border-radius:6px; background:#ffffff;">
             <tr><td style="padding:16px;">
               <div style="font-family:Georgia,'Times New Roman',serif; font-size:17px; color:{NAVY_900}; margin-bottom:6px;">{headline}</div>
-              <div style="font-family:Arial,sans-serif; font-size:13px; font-weight:bold; color:{MUTED}; margin-bottom:8px;">
-                {display_ticker} &nbsp;·&nbsp; ${s['price']} &nbsp;<span style="color:{color};">{arrow} {abs(s['pct_change'])}%</span>
+              <div style="font-family:Arial,sans-serif; font-size:13px; font-weight:bold; color:{MUTED}; margin-bottom:10px;">
+                {display_ticker} &nbsp;·&nbsp; ${s['price']}
               </div>
-              <div style="font-family:Arial,sans-serif; font-size:14px; color:#333; line-height:1.5;">{body}</div>
+              <ul style="margin:0; padding-left:18px;">{bullets_html}</ul>
             </td></tr>
           </table>
         </td></tr>

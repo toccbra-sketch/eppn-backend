@@ -172,6 +172,109 @@ def get_macro_events(days_ahead=5):
     return [{"event": "Fed interest rate decision", "time": upcoming[0]}]
 
 
+def get_general_market_news(limit=6):
+    """Pulls Finnhub's general market news category (not tied to any single
+    ticker) — broad economic/world stories that could move markets overall.
+    Returns a list of headline strings, most recent first. Free tier, no
+    special access needed. Returns [] on failure rather than raising, since
+    the overview blurb is a nice-to-have, not something that should ever
+    break the newsletter send."""
+    try:
+        resp = requests.get(
+            "https://finnhub.io/api/v1/news",
+            params={"category": "general", "token": FINNHUB_API_KEY},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        items = resp.json() or []
+        return [i.get("headline", "") for i in items[:limit] if i.get("headline")]
+    except Exception as e:
+        print(f"General market news fetch failed: {e}")
+        return []
+
+
+MARKET_OVERVIEW_INSTRUCTIONS = """You are writing the opening line(s) of a daily investing newsletter. You'll be given a handful of general market/world news headlines and any upcoming Fed events below. Your job is to write a SHORT overview — no title, no headline, just 1-2 plain sentences — summarizing the one or two biggest stories relevant to markets overall today.
+
+RULES:
+- 1-2 sentences total. This sits above everyone's personalized stock section, so keep it tight.
+- No title, no header, no bullet points — just the sentence(s) themselves.
+- Prioritize FORWARD-LOOKING items: an upcoming Fed decision, a scheduled economic report, a pending policy decision, a world event still unfolding — over stories that already fully played out.
+- If there's an upcoming Fed rate decision in the data below, it's fine to mention it plainly (date only, no prediction of the outcome).
+- Write in plain, everyday language — no jargon, no textbook tone. Explain any necessary term briefly, right there.
+- Do NOT use the words "buy," "sell," "hold," or any action-nudging phrases ("good time to," "worth considering," etc.).
+- Do NOT predict which way any market or price will move.
+- Do NOT invent a story that isn't reflected in the headlines below — only summarize what's genuinely there.
+- If the headlines are mostly noise with nothing genuinely notable, write a short neutral line noting markets are digesting mixed news — don't force drama that isn't there.
+
+Call the submit_overview tool with your result."""
+
+
+def generate_market_overview(headlines, macro_events=None):
+    """One Claude call per newsletter run (not per subscriber) producing a
+    short, shared 'what's moving markets today' line. Returns a plain string,
+    or None if generation fails — the newsletter should never block on this."""
+    if not headlines and not macro_events:
+        return None
+
+    macro_line = ""
+    if macro_events:
+        events_desc = "; ".join(
+            f"{e.get('event', 'Economic release')} on {str(e.get('time', ''))[:10]}"
+            for e in macro_events
+        )
+        macro_line = f"Upcoming macro events: {events_desc}."
+
+    headlines_block = "\n".join(f"- {h}" for h in headlines) or "No major headlines available."
+
+    dynamic_data = f"""Today's general market headlines:
+{headlines_block}
+{macro_line}"""
+
+    try:
+        response = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            tools=[{
+                "name": "submit_overview",
+                "description": "Submit the 1-2 sentence market overview.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "overview": {
+                            "type": "string",
+                            "description": "1-2 plain sentences, no title, following the rules above.",
+                        },
+                    },
+                    "required": ["overview"],
+                },
+            }],
+            tool_choice={"type": "tool", "name": "submit_overview"},
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": MARKET_OVERVIEW_INSTRUCTIONS, "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": dynamic_data},
+                ],
+            }]
+        )
+        tool_use_block = next((b for b in response.content if b.type == "tool_use"), None)
+        if not tool_use_block:
+            return None
+        overview = str(tool_use_block.input.get("overview", "")).strip()
+        if not overview:
+            return None
+
+        # Same forbidden-phrase safety net as the per-ticker blurbs.
+        if any(re.search(r'\b' + re.escape(p) + r'\b', overview.lower()) for p in FORBIDDEN_PHRASES):
+            print("WARNING: market overview contained flagged language, omitting it")
+            return None
+
+        return overview
+    except Exception as e:
+        print(f"Market overview generation failed: {e}")
+        return None
+
+
 
 # SEC EDGAR's ticker-to-CIK mapping is a single free JSON file, refreshed by
 # the SEC periodically. We fetch it once per run and cache it in memory —
@@ -539,7 +642,7 @@ STYLE for this one: {style_hint}"""
     return {"headline": headline, "bullets": bullets}
 
 
-def build_email_html(name, stock_sections, sponsor=None, referral_count=0):
+def build_email_html(name, stock_sections, sponsor=None, referral_count=0, market_overview=None):
     # Colors matched to eppn-common.css so the email looks like an extension
     # of the site rather than a separate, older-looking product.
     NAVY_900 = "#0a1930"
@@ -581,6 +684,14 @@ def build_email_html(name, stock_sections, sponsor=None, referral_count=0):
     timestamp = datetime.now(zoneinfo.ZoneInfo("America/New_York")).strftime("%B %-d, %Y — %-I:%M %p ET")
 
     disclaimer_style = f"font-family:Arial,sans-serif; font-size:11px; color:#888; line-height:1.5; margin:0 0 10px;"
+
+    overview_html = ""
+    if market_overview:
+        overview_html = f"""
+        <div style="font-family:Arial,sans-serif; font-size:14px; color:#333; line-height:1.6; padding:12px 14px; margin-bottom:16px; border-left:3px solid {NAVY_700}; background:#f6f5f1;">
+          {market_overview}
+        </div>
+        """
 
     sponsor_html = ""
     if sponsor:
@@ -625,9 +736,28 @@ def build_email_html(name, stock_sections, sponsor=None, referral_count=0):
         <div style="font-family:Arial,sans-serif; font-size:12px; color:#999; margin-bottom:14px;">
           Prices as of {timestamp}
         </div>
+
+        {overview_html}
+
         <div style="font-family:Arial,sans-serif; font-size:14px; color:#333; margin-bottom:16px;">
           Hi {name}, here's what's happening with your stocks today.
         </div>
+
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:18px;">
+          <tr><td style="background:{NAVY_900}; border-radius:6px; padding:14px 16px;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+              <td style="vertical-align:middle;">
+                <div style="font-family:Arial,sans-serif; font-size:13px; color:#c9d3e0;">Your referrals</div>
+                <div style="font-family:Georgia,'Times New Roman',serif; font-size:22px; color:#ffffff;">{referral_count}</div>
+              </td>
+              <td style="text-align:right; vertical-align:middle;">
+                <a href="{SITE_BASE}/referrals.html" style="display:inline-block; background:#ffffff; color:{NAVY_900}; font-family:Arial,sans-serif; font-size:13px; font-weight:bold; text-decoration:none; padding:9px 16px; border-radius:4px;">
+                  Share your link
+                </a>
+              </td>
+            </tr></table>
+          </td></tr>
+        </table>
 
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
           {sections_html}
@@ -660,7 +790,7 @@ def build_email_html(name, stock_sections, sponsor=None, referral_count=0):
               [Your business mailing address here — required by the CAN-SPAM Act for commercial email]
             </p>
             <p style="text-align:center; font-family:Arial,sans-serif; font-size:12px; color:{MUTED}; margin:0;">
-              <a href="{SITE_BASE}/referrals.html" style="color:{MUTED}; text-decoration:underline;">Your Referrals: <strong style="color:{NAVY_900};">{referral_count}</strong></a>
+              <a href="{SITE_BASE}/referrals.html" style="color:{MUTED}; text-decoration:underline;">Manage your referral link</a>
             </p>
           </td></tr>
         </table>
@@ -732,6 +862,11 @@ def main():
     macro_events = get_macro_events()
     sponsor = get_active_sponsor()
 
+    # Same overview blurb goes to every subscriber, so it's generated once for
+    # the whole run rather than once per person — saves an API call per subscriber.
+    market_headlines = get_general_market_news()
+    market_overview = generate_market_overview(market_headlines, macro_events=macro_events)
+
     # Cache stock snapshots/blurbs so we don't re-fetch/re-generate per subscriber
     # if multiple people hold the same stock.
     cache = {}
@@ -765,7 +900,7 @@ def main():
             print(f"No valid stock data for {email}, skipping")
             continue
 
-        html = build_email_html(name, stock_sections, sponsor=sponsor, referral_count=referral_count)
+        html = build_email_html(name, stock_sections, sponsor=sponsor, referral_count=referral_count, market_overview=market_overview)
         try:
             send_email(email, "Your daily portfolio update — The Portfolio Briefcase", html)
             print(f"Sent to {email}")

@@ -372,22 +372,63 @@ def get_recent_headline(ticker, days=3):
     return None
 
 
+def _price_performance_from_closes(dated_closes, current_price, today):
+    """Shared math for both data sources below — takes a list of (date, close)
+    tuples and computes 5d/1m/YTD % change from current_price."""
+    from datetime import timedelta, date as date_cls
+
+    def closest_close_on_or_before(target_date):
+        candidates = [c for d, c in dated_closes if d <= target_date]
+        return candidates[-1] if candidates else None
+
+    def closest_close_on_or_after(target_date):
+        candidates = [c for d, c in dated_closes if d >= target_date]
+        return candidates[0] if candidates else None
+
+    result = {}
+    close_5d = closest_close_on_or_before(today - timedelta(days=7))
+    if close_5d:
+        result["5d"] = round((current_price - close_5d) / close_5d * 100, 1)
+
+    close_1m = closest_close_on_or_before(today - timedelta(days=30))
+    if close_1m:
+        result["1m"] = round((current_price - close_1m) / close_1m * 100, 1)
+
+    close_ytd = closest_close_on_or_after(date_cls(today.year, 1, 1))
+    if close_ytd:
+        result["ytd"] = round((current_price - close_ytd) / close_ytd * 100, 1)
+
+    return result
+
+
 def get_price_performance(ticker, current_price):
-    """Computes % price change over 5-day, 1-month, and year-to-date windows
-    using Finnhub's free daily-candle endpoint (1 year of history per call on
-    the free tier — plenty). 1-day change is handled separately in
-    get_stock_snapshot via the quote endpoint's previous-close field, since
-    that's more precise than a candle lookup.
+    """Computes % price change over 5-day, 1-month, and year-to-date windows.
+    Three independent sources, tried in order, each only used if the previous
+    one fails: yfinance (Yahoo) -> Finnhub candles (requires a paid Finnhub
+    plan, 403s on free tier) -> Stooq (free, keyless, different infrastructure
+    entirely from the first two). This 3-way fallback exists because in
+    practice, Yahoo and Finnhub have both failed in the SAME run before —
+    having a third, unrelated source matters. 1-day change is handled
+    separately via the quote endpoint's previous-close field.
 
     Returns a dict like {"5d": -2.3, "1m": 6.1, "ytd": 14.8} — any window that
-    can't be computed (holiday gaps, IPO too recent, API hiccup, etc.) is
-    simply omitted rather than guessed at."""
+    can't be computed is simply omitted rather than guessed at."""
     from datetime import date, timedelta, datetime, timezone
 
+    today = date.today()
+    start = date(today.year - 1, 1, 1)
+
     try:
-        today = date.today()
-        # Go back far enough to always cover YTD even if run in early January.
-        start = date(today.year - 1, 1, 1)
+        import yfinance as yf
+        hist = yf.Ticker(ticker).history(start=start.isoformat(), end=(today + timedelta(days=1)).isoformat())
+        if not hist.empty:
+            dated_closes = [(idx.date(), row["Close"]) for idx, row in hist.iterrows()]
+            dated_closes.sort(key=lambda x: x[0])
+            return _price_performance_from_closes(dated_closes, current_price, today)
+    except Exception as e:
+        print(f"yfinance price history lookup failed for {ticker}, trying Finnhub: {e}")
+
+    try:
         from_ts = int(datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc).timestamp())
         to_ts = int(datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc).timestamp()) + 86400
 
@@ -399,38 +440,50 @@ def get_price_performance(ticker, current_price):
         resp.raise_for_status()
         data = resp.json()
         if data.get("s") != "ok" or not data.get("c"):
-            return {}
+            return _try_stooq_price_performance(ticker, current_price, today, start)
 
-        # Pair up (date, close) ascending by time.
         closes = list(zip(data["t"], data["c"]))
         closes.sort(key=lambda x: x[0])
         dated_closes = [(datetime.fromtimestamp(t, tz=timezone.utc).date(), c) for t, c in closes]
-
-        def closest_close_on_or_before(target_date):
-            candidates = [c for d, c in dated_closes if d <= target_date]
-            return candidates[-1] if candidates else None
-
-        def closest_close_on_or_after(target_date):
-            candidates = [c for d, c in dated_closes if d >= target_date]
-            return candidates[0] if candidates else None
-
-        result = {}
-
-        close_5d = closest_close_on_or_before(today - timedelta(days=7))
-        if close_5d:
-            result["5d"] = round((current_price - close_5d) / close_5d * 100, 1)
-
-        close_1m = closest_close_on_or_before(today - timedelta(days=30))
-        if close_1m:
-            result["1m"] = round((current_price - close_1m) / close_1m * 100, 1)
-
-        close_ytd = closest_close_on_or_after(date(today.year, 1, 1))
-        if close_ytd:
-            result["ytd"] = round((current_price - close_ytd) / close_ytd * 100, 1)
-
-        return result
+        return _price_performance_from_closes(dated_closes, current_price, today)
     except Exception as e:
-        print(f"Price performance lookup failed for {ticker}: {e}")
+        print(f"Finnhub price performance lookup failed for {ticker}, trying Stooq: {e}")
+        return _try_stooq_price_performance(ticker, current_price, today, start)
+
+
+def _try_stooq_price_performance(ticker, current_price, today, start):
+    """Third and last fallback: Stooq's free, keyless daily-history CSV. Not
+    affiliated with Yahoo or Finnhub — different infrastructure entirely, so
+    it's unlikely to fail at the same time those two do (as happened in
+    practice: Yahoo returned empty history AND Finnhub 403'd in the same run).
+    Only works for plain US-listed tickers, not crypto (colon-prefixed)."""
+    if ":" in ticker:
+        return {}
+    try:
+        resp = requests.get(
+            "https://stooq.com/q/d/l/",
+            params={"s": f"{ticker.lower()}.us", "d1": start.strftime("%Y%m%d"), "d2": today.strftime("%Y%m%d"), "i": "d"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        lines = resp.text.strip().splitlines()
+        if len(lines) < 2 or not lines[0].startswith("Date"):
+            return {}
+        from datetime import date as date_cls
+        dated_closes = []
+        for line in lines[1:]:
+            parts = line.split(",")
+            if len(parts) >= 5:
+                try:
+                    dated_closes.append((date_cls.fromisoformat(parts[0]), float(parts[4])))
+                except ValueError:
+                    continue
+        if not dated_closes:
+            return {}
+        dated_closes.sort(key=lambda x: x[0])
+        return _price_performance_from_closes(dated_closes, current_price, today)
+    except Exception as e:
+        print(f"Stooq price performance lookup also failed for {ticker}: {e}")
         return {}
 
 
@@ -692,6 +745,59 @@ def get_holdings_news(ticker):
     return results
 
 
+def get_fund_info(ticker):
+    """Gets the fund's REAL category, full name, and Yahoo's own asset-type
+    classification (quoteType) — so the newsletter doesn't wrongly assume
+    every ticker in KNOWN_FUNDS is a broad-market index fund, AND so a fund
+    that's MISSING from KNOWN_FUNDS (a hand-maintained list — it will miss
+    things, as it already did for one ticker) still gets correctly identified
+    as a fund rather than treated like an individual company. Tries
+    yfinance's category/quoteType fields first; some niche/leveraged tickers
+    lack that data on Yahoo entirely (this fails normally, not a bug), so it
+    falls back to just the fund's official full name from Finnhub's profile
+    endpoint — often the name alone reveals the focus (e.g. "Amplify
+    Cybersecurity ETF" makes it obvious even with no formal category field).
+    Returns {"category": ..., "name": ..., "quote_type": ...} (any may be
+    None) or None if nothing came back from either source."""
+    category, name, quote_type = None, None, None
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info
+        category = info.get("category")
+        name = info.get("longName") or info.get("shortName")
+        quote_type = info.get("quoteType")  # "ETF", "MUTUALFUND", "EQUITY", etc.
+    except Exception as e:
+        print(f"yfinance fund info lookup failed for {ticker}, trying Finnhub: {e}")
+
+    if not name:
+        try:
+            resp = requests.get(
+                "https://finnhub.io/api/v1/stock/profile2",
+                params={"symbol": ticker, "token": FINNHUB_API_KEY},
+                timeout=20,
+            )
+            if resp.ok:
+                name = resp.json().get("name") or name
+        except Exception as e:
+            print(f"Finnhub profile lookup failed for {ticker}: {e}")
+
+    if not (category or name or quote_type):
+        return None
+    return {"category": category, "name": name, "quote_type": quote_type}
+
+
+def is_fund_ticker(ticker, fund_info=None):
+    """KNOWN_FUNDS is hand-maintained and WILL occasionally miss a fund (it
+    already has, silently, before this check existed) — this treats it as a
+    starting guess, not the final word. If Yahoo's own quoteType data says
+    "ETF" or "MUTUALFUND", that overrides the guess even if the ticker isn't
+    in the hardcoded set at all. Falls back to the set alone if quote_type
+    data isn't available for this ticker."""
+    if fund_info and fund_info.get("quote_type") in ("ETF", "MUTUALFUND"):
+        return True
+    return ticker in KNOWN_FUNDS
+
+
 def get_stock_snapshot(ticker, macro_events=None, max_retries=3):
     """Pull current price + a recent headline for one ticker via Finnhub."""
     for attempt in range(1, max_retries + 1):
@@ -714,14 +820,20 @@ def get_stock_snapshot(ticker, macro_events=None, max_retries=3):
             pct_change = ((current_price - prev_close) / prev_close) * 100
 
             headline = get_recent_headline(ticker, days=3)
-            is_fund = ticker in KNOWN_FUNDS
             is_crypto = ":" in ticker
+            # Fetched for every non-crypto ticker (not just ones already in
+            # KNOWN_FUNDS) so a fund that's missing from that hardcoded set
+            # still gets correctly identified rather than treated like a stock.
+            fund_info = None if is_crypto else get_fund_info(ticker)
+            is_fund = False if is_crypto else is_fund_ticker(ticker, fund_info)
 
             return {
                 "ticker": ticker,
                 "price": round(current_price, 2),
                 "pct_change": round(pct_change, 2),
                 "headline": headline,
+                "is_fund": is_fund,
+                "is_crypto": is_crypto,
                 "earnings": None if is_fund or is_crypto else get_upcoming_earnings(ticker),
                 "macro_events": (macro_events or []) if is_fund else [],
                 "sec_filing": None if is_fund or is_crypto else get_sec_filings(ticker),
@@ -729,6 +841,7 @@ def get_stock_snapshot(ticker, macro_events=None, max_retries=3):
                 "key_metrics": {} if is_fund or is_crypto else get_key_metrics(ticker),
                 "dividend_info": None if is_crypto else get_dividend_info(ticker),
                 "holdings_news": get_holdings_news(ticker) if is_fund else [],
+                "fund_info": fund_info if is_fund else None,
             }
         except Exception as e:
             print(f"Attempt {attempt}/{max_retries} failed for {ticker}: {e}")
@@ -765,6 +878,7 @@ KNOWN_FUNDS = {
     "VOO", "SPY", "VTI", "QQQ", "IVV", "VXUS", "VEA", "VWO", "BND", "AGG",
     "ARKK", "DIA", "IWM", "SCHD", "VYM", "VUG", "VTV", "XLK", "XLF", "XLE",
     "TQQQ", "UCYB", "SQQQ", "SOXL", "SOXS", "UPRO", "SPXL", "SPXS", "TMF", "TMV",
+    "NLR",
 }
 
 # Rotated through so consecutive blurbs don't all lean on the same opening
@@ -872,10 +986,11 @@ Call the submit_blurb tool with your headline and bullets."""
 def generate_blurb(snapshot, variation_index=0):
     """Ask Claude for a catchy headline + short educational blurb. Never buy/sell language.
     Returns a dict: {"headline": ..., "body": ...}"""
-    is_fund = snapshot['ticker'] in KNOWN_FUNDS
-    # Crypto/forex symbols on Finnhub use an exchange-prefixed format like
-    # "BINANCE:BTCUSDT" — the colon is a reliable signal it's not a stock/fund.
-    is_crypto = ":" in snapshot['ticker']
+    # Read the already-corrected flags from the snapshot (set in get_stock_snapshot,
+    # which self-corrects KNOWN_FUNDS misses using real quoteType data) rather than
+    # re-deriving from the raw hardcoded set here, which would just repeat the bug.
+    is_fund = snapshot.get('is_fund', snapshot['ticker'] in KNOWN_FUNDS)
+    is_crypto = snapshot.get('is_crypto', ":" in snapshot['ticker'])
 
     if is_crypto:
         asset_type_note = (
@@ -885,12 +1000,34 @@ def generate_blurb(snapshot, variation_index=0):
             "24/7 and tend to be more volatile than stocks — you can note this as general context if relevant."
         )
     elif is_fund:
-        asset_type_note = (
-            "This ticker is a broad-market index fund or ETF, not a single company — it holds many "
-            "underlying stocks. Do NOT reference 'earnings reports' or talk about it as if it were one "
-            "company. If news on its top individual holdings is given below, lean on that heavily — "
-            "specific company-level news is far more useful to a reader than generic sector talk."
-        )
+        fund_info = snapshot.get("fund_info")
+        if fund_info and (fund_info.get("category") or fund_info.get("name")):
+            known_bits = []
+            if fund_info.get("name"):
+                known_bits.append(f'full name "{fund_info["name"]}"')
+            if fund_info.get("category"):
+                known_bits.append(f'category "{fund_info["category"]}"')
+            known_desc = " and ".join(known_bits)
+            asset_type_note = (
+                f"This ticker is a fund/ETF, not a single company — it holds many underlying "
+                f"positions. Its {known_desc} — USE THIS to correctly identify what kind of fund it "
+                f"actually is (e.g. broad-market, sector-specific like cybersecurity/energy/"
+                f"semiconductors, thematic, leveraged, bond fund, etc.). Do NOT default to describing "
+                f"it as a 'broad market index fund' unless its name/category genuinely says so — a "
+                f"cybersecurity fund is not a broad-market fund, for example. Do NOT reference "
+                f"'earnings reports' or talk about it as if it were one company. If news on its top "
+                f"individual holdings is given below, lean on that heavily — specific company-level "
+                f"news is far more useful to a reader than generic sector talk."
+            )
+        else:
+            asset_type_note = (
+                "This ticker is a fund/ETF, not a single company. Its specific category/focus could NOT "
+                "be determined automatically — do NOT guess or assume it's a broad-market index fund, "
+                "since it may well be a niche sector, thematic, or leveraged fund instead. Speak about it "
+                "generically as 'this fund' without asserting a specific focus area, unless the ticker "
+                "name or headline below makes the focus obvious on its own. Do NOT reference 'earnings "
+                "reports' or talk about it as if it were one company."
+            )
     else:
         asset_type_note = (
             "This ticker is an individual company's stock. If key financial metrics are given below, use "

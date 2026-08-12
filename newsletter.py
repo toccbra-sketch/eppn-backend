@@ -346,6 +346,352 @@ def get_sec_filings(ticker, days_back=10):
         return None
 
 
+def get_recent_headline(ticker, days=3):
+    """Pulls the single most recent company-news headline for a ticker.
+    Shared by get_stock_snapshot (for the ticker itself) and the ETF
+    top-holdings lookup below (for its biggest constituents)."""
+    try:
+        from datetime import date, timedelta
+        today = date.today()
+        resp = requests.get(
+            "https://finnhub.io/api/v1/company-news",
+            params={
+                "symbol": ticker,
+                "from": (today - timedelta(days=days)).isoformat(),
+                "to": today.isoformat(),
+                "token": FINNHUB_API_KEY,
+            },
+            timeout=20,
+        )
+        if resp.ok:
+            items = resp.json()
+            if items:
+                return items[0].get("headline")
+    except Exception as e:
+        print(f"Headline fetch failed for {ticker}: {e}")
+    return None
+
+
+def get_price_performance(ticker, current_price):
+    """Computes % price change over 5-day, 1-month, and year-to-date windows
+    using Finnhub's free daily-candle endpoint (1 year of history per call on
+    the free tier — plenty). 1-day change is handled separately in
+    get_stock_snapshot via the quote endpoint's previous-close field, since
+    that's more precise than a candle lookup.
+
+    Returns a dict like {"5d": -2.3, "1m": 6.1, "ytd": 14.8} — any window that
+    can't be computed (holiday gaps, IPO too recent, API hiccup, etc.) is
+    simply omitted rather than guessed at."""
+    from datetime import date, timedelta, datetime, timezone
+
+    try:
+        today = date.today()
+        # Go back far enough to always cover YTD even if run in early January.
+        start = date(today.year - 1, 1, 1)
+        from_ts = int(datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc).timestamp())
+        to_ts = int(datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc).timestamp()) + 86400
+
+        resp = requests.get(
+            "https://finnhub.io/api/v1/stock/candle",
+            params={"symbol": ticker, "resolution": "D", "from": from_ts, "to": to_ts, "token": FINNHUB_API_KEY},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("s") != "ok" or not data.get("c"):
+            return {}
+
+        # Pair up (date, close) ascending by time.
+        closes = list(zip(data["t"], data["c"]))
+        closes.sort(key=lambda x: x[0])
+        dated_closes = [(datetime.fromtimestamp(t, tz=timezone.utc).date(), c) for t, c in closes]
+
+        def closest_close_on_or_before(target_date):
+            candidates = [c for d, c in dated_closes if d <= target_date]
+            return candidates[-1] if candidates else None
+
+        def closest_close_on_or_after(target_date):
+            candidates = [c for d, c in dated_closes if d >= target_date]
+            return candidates[0] if candidates else None
+
+        result = {}
+
+        close_5d = closest_close_on_or_before(today - timedelta(days=7))
+        if close_5d:
+            result["5d"] = round((current_price - close_5d) / close_5d * 100, 1)
+
+        close_1m = closest_close_on_or_before(today - timedelta(days=30))
+        if close_1m:
+            result["1m"] = round((current_price - close_1m) / close_1m * 100, 1)
+
+        close_ytd = closest_close_on_or_after(date(today.year, 1, 1))
+        if close_ytd:
+            result["ytd"] = round((current_price - close_ytd) / close_ytd * 100, 1)
+
+        return result
+    except Exception as e:
+        print(f"Price performance lookup failed for {ticker}: {e}")
+        return {}
+
+
+def get_key_metrics(ticker):
+    """Pulls a curated handful of hard fundamental numbers from Finnhub's free
+    basic-financials endpoint (P/E, revenue/EPS growth, margins, dividend
+    yield). Finnhub's exact field names have shifted over time, so each metric
+    tries a couple of known key variants and takes whichever is present.
+    Returns a dict of only the metrics that actually came back — never
+    fabricated. Only meaningful for individual companies, not funds/crypto."""
+    try:
+        resp = requests.get(
+            "https://finnhub.io/api/v1/stock/metric",
+            params={"symbol": ticker, "metric": "all", "token": FINNHUB_API_KEY},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        m = resp.json().get("metric", {}) or {}
+
+        def pick(*keys):
+            for k in keys:
+                v = m.get(k)
+                if v is not None:
+                    return v
+            return None
+
+        raw = {
+            "P/E (TTM)": pick("peTTM", "peBasicExclExtraTTM", "peExclExtraTTM"),
+            "Revenue growth YoY": pick("revenueGrowthTTMYoy", "revenueGrowthQuarterlyYoy"),
+            "EPS growth YoY": pick("epsGrowthTTMYoy", "epsGrowthQuarterlyYoy"),
+            "Gross margin": pick("grossMarginTTM", "grossMarginAnnual"),
+            "Net margin": pick("netProfitMarginTTM", "netProfitMarginAnnual"),
+            "Dividend yield": pick("dividendYieldIndicatedAnnual", "currentDividendYieldTTM"),
+        }
+        return {k: v for k, v in raw.items() if v is not None}
+    except Exception as e:
+        print(f"Key metrics lookup failed for {ticker}: {e}")
+        return {}
+
+
+def _dividend_estimate_from_history(ticker):
+    """FALLBACK ONLY. Finnhub's dividend endpoint returns historical payments,
+    not confirmed future ones — this ESTIMATES the next ex-dividend date by
+    taking the most recent payment and adding ~1 quarter. Only used if the
+    live yfinance lookup below fails. Returns {"estimated_date": "...",
+    "based_on": "..."} or None."""
+    from datetime import date, timedelta
+    try:
+        resp = requests.get(
+            "https://finnhub.io/api/v1/stock/dividend",
+            params={
+                "symbol": ticker,
+                "from": (date.today() - timedelta(days=200)).isoformat(),
+                "to": date.today().isoformat(),
+                "token": FINNHUB_API_KEY,
+            },
+            timeout=20,
+        )
+        if not resp.ok:
+            return None
+        items = resp.json()
+        if not items:
+            return None
+        items.sort(key=lambda x: x.get("date", ""), reverse=True)
+        last_date = items[0].get("date")
+        if not last_date:
+            return None
+        est = (date.fromisoformat(last_date) + timedelta(days=91)).isoformat()
+        return {"estimated_date": est, "based_on": last_date}
+    except Exception as e:
+        print(f"Dividend estimate fallback failed for {ticker}: {e}")
+        return None
+
+
+def get_dividend_info(ticker):
+    """Tries to get the REAL, company-declared next ex-dividend date via
+    yfinance (reads Yahoo Finance's tracked calendar data — free, no API key,
+    but unofficial/scraped so it can occasionally fail or lag). Falls back to
+    a heuristic estimate (last payment + ~1 quarter) if that doesn't work.
+    Returns {"date": "...", "confirmed": True/False, "based_on": "..." (only
+    when not confirmed)} or None if nothing is available either way."""
+    try:
+        import yfinance as yf
+        cal = yf.Ticker(ticker).calendar
+        if cal:
+            ex_div = cal.get("Ex-Dividend Date") or cal.get("Dividend Date")
+            if ex_div:
+                ex_div_str = ex_div.isoformat() if hasattr(ex_div, "isoformat") else str(ex_div)
+                return {"date": ex_div_str, "confirmed": True}
+    except Exception as e:
+        print(f"yfinance dividend lookup failed for {ticker}, falling back: {e}")
+
+    fallback = _dividend_estimate_from_history(ticker)
+    if fallback:
+        return {"date": fallback["estimated_date"], "confirmed": False, "based_on": fallback["based_on"]}
+    return None
+
+
+# FALLBACK ONLY — approximate top holdings for common funds, hand-maintained
+# and will drift out of date. Only used if the live yfinance lookup below
+# fails (e.g. Yahoo rate-limits the request). Revisit every few months.
+ETF_TOP_HOLDINGS_FALLBACK = {
+    "VOO": ["AAPL", "MSFT", "NVDA"], "SPY": ["AAPL", "MSFT", "NVDA"],
+    "IVV": ["AAPL", "MSFT", "NVDA"], "VTI": ["AAPL", "MSFT", "NVDA"],
+    "QQQ": ["AAPL", "MSFT", "NVDA"], "TQQQ": ["AAPL", "MSFT", "NVDA"], "SQQQ": ["AAPL", "MSFT", "NVDA"],
+    "DIA": ["UNH", "GS", "MSFT"],
+    "XLK": ["AAPL", "MSFT", "NVDA"], "XLF": ["JPM", "V", "MA"], "XLE": ["XOM", "CVX", "COP"],
+    "ARKK": ["TSLA", "COIN", "ROKU"],
+    "SCHD": ["ABBV", "PEP", "HD"], "VYM": ["JPM", "XOM", "JNJ"],
+    "VUG": ["AAPL", "MSFT", "NVDA"], "VTV": ["JPM", "XOM", "JNJ"],
+    "UPRO": ["AAPL", "MSFT", "NVDA"], "SPXL": ["AAPL", "MSFT", "NVDA"], "SPXS": ["AAPL", "MSFT", "NVDA"],
+}
+
+
+def get_spdr_holdings(ticker, top_n=3):
+    """Official, authoritative holdings straight from State Street's own site
+    — no API key, no rate limit (it's just a public XLSX file they're required
+    to publish daily). Covers SPY/DIA/XLK/XLF/XLE and other SPDR funds. The
+    exact header row position isn't hardcoded — this scans for the row
+    containing "Ticker" as a column header, since issuer file layouts shift
+    occasionally and hardcoding a skiprows count is fragile."""
+    try:
+        import pandas as pd
+        import io
+        url = f"https://www.ssga.com/us/en/institutional/library-content/products/fund-data/etfs/us/holdings-daily-us-en-{ticker.lower()}.xlsx"
+        resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+
+        raw = pd.read_excel(io.BytesIO(resp.content), header=None)
+        header_row = None
+        for i, row in raw.iterrows():
+            if row.astype(str).str.strip().str.lower().eq("ticker").any():
+                header_row = i
+                break
+        if header_row is None:
+            return None
+
+        df = pd.read_excel(io.BytesIO(resp.content), header=header_row)
+        df.columns = [str(c).strip() for c in df.columns]
+        ticker_col = next((c for c in df.columns if c.lower() == "ticker"), None)
+        weight_col = next((c for c in df.columns if "weight" in c.lower()), None)
+        if not ticker_col:
+            return None
+        if weight_col:
+            df[weight_col] = pd.to_numeric(df[weight_col], errors="coerce")
+            df = df.sort_values(weight_col, ascending=False)
+        symbols = [str(t).strip() for t in df[ticker_col].tolist() if isinstance(t, str) and str(t).strip().isalpha()]
+        return symbols[:top_n] if symbols else None
+    except Exception as e:
+        print(f"SPDR official holdings lookup failed for {ticker}: {e}")
+        return None
+
+
+# Confirmed iShares product IDs (the numeric ID in the fund's ishares.com URL
+# — visible right in the browser address bar on that fund's page, e.g.
+# ishares.com/us/products/{ID}/{fund-name}). Add more here as needed; this
+# only covers what's been verified. Not every iShares fund is worth adding —
+# only ones you actually hold.
+ISHARES_HOLDINGS_URLS = {
+    "IVV": "https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf/1467271812596.ajax?fileType=csv&fileName=IVV_holdings&dataType=fund",
+    "IWM": "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund",
+}
+
+
+def get_ishares_holdings(ticker, top_n=3):
+    """Official iShares (BlackRock) holdings CSV — same idea as the SPDR
+    fetch above: a public file they're required to publish, no key, no rate
+    limit. Only covers tickers in ISHARES_HOLDINGS_URLS above."""
+    url = ISHARES_HOLDINGS_URLS.get(ticker)
+    if not url:
+        return None
+    try:
+        resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        lines = resp.text.splitlines()
+        header_idx = next((i for i, l in enumerate(lines) if l.strip().startswith("Ticker,")), None)
+        if header_idx is None:
+            return None
+
+        import pandas as pd
+        import io
+        df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
+        df.columns = [str(c).strip() for c in df.columns]
+        weight_col = next((c for c in df.columns if "weight" in c.lower()), None)
+        if weight_col:
+            df[weight_col] = pd.to_numeric(df[weight_col], errors="coerce")
+            df = df.sort_values(weight_col, ascending=False)
+        symbols = [str(t).strip() for t in df["Ticker"].tolist() if isinstance(t, str) and str(t).strip().isalpha()]
+        return symbols[:top_n] if symbols else None
+    except Exception as e:
+        print(f"iShares official holdings lookup failed for {ticker}: {e}")
+        return None
+
+
+# SPDR funds with a confirmed working ssga.com file naming pattern.
+SPDR_TICKERS = {"SPY", "DIA", "XLK", "XLF", "XLE"}
+
+# Leveraged/inverse funds don't hold real company stock (they hold swaps and
+# futures) — their own issuer filing wouldn't give useful ticker-level news
+# anyway. Point these at the plain index fund they track instead, so they get
+# real, meaningful top-holdings news rather than a swap counterparty name.
+LEVERAGED_FUND_UNDERLYING = {
+    "TQQQ": "QQQ", "SQQQ": "QQQ",
+    "UPRO": "SPY", "SPXL": "SPY", "SPXS": "SPY",
+}
+
+
+def get_live_etf_holdings(ticker, top_n=3):
+    """Real top holdings via yfinance's funds_data (reads Yahoo Finance's
+    tracked fund composition — free, no key, updated regularly, but unofficial
+    so treat failures as expected/normal, not bugs). Returns a list of ticker
+    symbols sorted by weight, or None if unavailable (caller falls back to
+    the hardcoded table)."""
+    try:
+        import yfinance as yf
+        holdings_df = yf.Ticker(ticker).funds_data.top_holdings
+        if holdings_df is None or holdings_df.empty:
+            return None
+        weight_col = next(
+            (c for c in holdings_df.columns if "percent" in c.lower() or "weight" in c.lower()),
+            None
+        )
+        if weight_col:
+            holdings_df = holdings_df.sort_values(weight_col, ascending=False)
+        return list(holdings_df.index[:top_n])
+    except Exception as e:
+        print(f"yfinance holdings lookup failed for {ticker}, falling back: {e}")
+        return None
+
+
+def get_holdings_news(ticker):
+    """Pulls one recent headline per top holding of a fund. Priority order,
+    each falling through to the next only on failure:
+      1. Leveraged/inverse funds -> redirect to their underlying index fund.
+      2. Official issuer CSV/XLSX (SPDR, then iShares) — authoritative, free,
+         no rate-limit risk, since it's a public file each issuer must publish.
+      3. yfinance (Yahoo Finance's tracked data) — real, free, no key, but
+         unofficial and can occasionally be rate-limited.
+      4. Hand-maintained hardcoded table — last resort, keeps things working
+         even if every live source is down.
+    Returns a list of {"ticker", "headline"} for holdings that had news."""
+    lookup_ticker = LEVERAGED_FUND_UNDERLYING.get(ticker, ticker)
+
+    holdings = None
+    if lookup_ticker in SPDR_TICKERS:
+        holdings = get_spdr_holdings(lookup_ticker)
+    if not holdings and lookup_ticker in ISHARES_HOLDINGS_URLS:
+        holdings = get_ishares_holdings(lookup_ticker)
+    if not holdings:
+        holdings = get_live_etf_holdings(lookup_ticker)
+    if not holdings:
+        holdings = ETF_TOP_HOLDINGS_FALLBACK.get(lookup_ticker, [])
+
+    results = []
+    for h in holdings:
+        headline = get_recent_headline(h, days=3)
+        if headline:
+            results.append({"ticker": h, "headline": headline})
+    return results
+
+
 def get_stock_snapshot(ticker, macro_events=None, max_retries=3):
     """Pull current price + a recent headline for one ticker via Finnhub."""
     for attempt in range(1, max_retries + 1):
@@ -367,33 +713,22 @@ def get_stock_snapshot(ticker, macro_events=None, max_retries=3):
 
             pct_change = ((current_price - prev_close) / prev_close) * 100
 
-            # Recent company news (last 3 days)
-            headline = None
-            from datetime import date, timedelta
-            today = date.today()
-            news_resp = requests.get(
-                "https://finnhub.io/api/v1/company-news",
-                params={
-                    "symbol": ticker,
-                    "from": (today - timedelta(days=3)).isoformat(),
-                    "to": today.isoformat(),
-                    "token": FINNHUB_API_KEY,
-                },
-                timeout=20
-            )
-            if news_resp.ok:
-                news_items = news_resp.json()
-                if news_items:
-                    headline = news_items[0].get("headline")
+            headline = get_recent_headline(ticker, days=3)
+            is_fund = ticker in KNOWN_FUNDS
+            is_crypto = ":" in ticker
 
             return {
                 "ticker": ticker,
                 "price": round(current_price, 2),
-                "pct_change": round(pct_change, 2),  # kept internally for style-hint variation only, not displayed
+                "pct_change": round(pct_change, 2),
                 "headline": headline,
-                "earnings": get_upcoming_earnings(ticker),
-                "macro_events": (macro_events or []) if ticker in KNOWN_FUNDS else [],
-                "sec_filing": None if ticker in KNOWN_FUNDS or ":" in ticker else get_sec_filings(ticker),
+                "earnings": None if is_fund or is_crypto else get_upcoming_earnings(ticker),
+                "macro_events": (macro_events or []) if is_fund else [],
+                "sec_filing": None if is_fund or is_crypto else get_sec_filings(ticker),
+                "price_performance": get_price_performance(ticker, current_price),
+                "key_metrics": {} if is_fund or is_crypto else get_key_metrics(ticker),
+                "dividend_info": None if is_crypto else get_dividend_info(ticker),
+                "holdings_news": get_holdings_news(ticker) if is_fund else [],
             }
         except Exception as e:
             print(f"Attempt {attempt}/{max_retries} failed for {ticker}: {e}")
@@ -449,59 +784,87 @@ STYLE_HINTS = [
 # premium on the first call that writes the cache, but only ~10% of normal
 # input price on every subsequent call within the cache window (5 min) that
 # reuses it — a net win as soon as a run generates more than one blurb.
-STATIC_BLURB_INSTRUCTIONS = """You are writing content for an educational investing newsletter. You'll be given data about one ticker below, and must produce a headline and a short list of simple, readable bullet points about it.
+STATIC_BLURB_INSTRUCTIONS = """You are writing content for an educational investing newsletter aimed at people who already own this holding and want SPECIFIC, useful information — not a generic description of what the company or fund is. Assume the reader already knows the basics; they want what's actually going on right now and what's coming up.
 
 Produce TWO things:
-1. A short, catchy, punny/playful headline (max 8 words) related to the news or upcoming date given
-   below — think newspaper-style wordplay tied to the company/fund or what's happening (e.g. for a
-   rocket company with a pending launch: "SpaceX Counts Down to Launch Day").
-   The headline must NOT imply the reader should buy, sell, or take any action, and must NOT be
-   about today's price move — focus it on what's coming up instead.
-2. Between 2 and 4 short bullet points, each ONE sentence, covering what's coming up and what could
-   matter next for this holding — NOT a recap of today's price action. This reader already sees the
-   price elsewhere; they want to know what's ahead. Pull bullets from whatever is available below,
-   in this priority order, and SKIP any category that has no data rather than writing a filler bullet:
-   a) Upcoming earnings date, if given — state the date (and timing, if known) plainly.
-   b) Upcoming macro/Fed events, if given (mainly for funds/ETFs) — state the event and date plainly.
-   c) A recent SEC filing, if given — briefly say what it is in plain English (e.g. an "8-K" is
-      "a filing disclosing a major company event," a "DEF 14A" is "a notice for an upcoming
-      shareholder vote," a "10-Q"/"10-K" is "a quarterly/annual financial report") and its date.
-   d) Read the "Recent headline" below for any OTHER concrete, forward-looking angle it mentions or
-      implies — a pending FDA decision, a scheduled court ruling, a merger vote, a product launch, a
-      world/economic event that could affect this holding (trade policy, geopolitical developments,
-      commodity prices, interest rates, etc.). If there's a real forward-looking angle in it, write
-      a bullet about that angle — not a recap of the headline as old news.
-   e) Only if there is genuinely nothing forward-looking available from (a)-(d), include ONE bullet
-      with a brief, neutral factual note about the holding (e.g. its sector or role in a portfolio)
-      instead of discussing the price move. Never fall back to describing today's price change.
-   Never predict which way the price will move. State facts and known dates, not forecasts.
-   IMPORTANT: If a category has no data, just omit it — never write things like "no earnings are
-   scheduled" or "no filings were found." Absence of an event is not newsworthy; skip it silently.
 
-READABILITY — this is written for everyday personal investors, not finance professionals. Follow these
-rules strictly:
-- Each bullet is ONE short, simple sentence. One idea per bullet, no run-ons.
-- Avoid financial jargon (e.g. don't say "volatility," "momentum," "valuation multiples," "market cap
-  compression" — say things like "the price swung a lot" or "investors reacted quickly" instead).
-- If a technical term is genuinely necessary (like a filing type), briefly explain it in plain words
-  right there in the same bullet.
-- Write like you're explaining it to a smart friend who doesn't follow the stock market closely —
-  clear and conversational, not textbook or press-release toned.
-- Do NOT mention specific price levels or percentage changes anywhere in the bullets.
+1. A short, catchy, punny/playful headline (max 8 words) tied to the specific news/data below (e.g.
+   for a rocket company with a pending launch: "SpaceX Counts Down to Launch Day"). Must NOT imply
+   the reader should buy, sell, or take any action.
 
-STRICT RULES — these are non-negotiable, for BOTH the headline and bullets:
+2. A set of 3-5 bullet points. Bullets can be ONE or TWO sentences each (two is fine when you're
+   connecting a specific number to why it matters) — but every sentence must contain a concrete,
+   specific fact: a date, a percentage, a dollar figure, a named event, a named product, a named
+   executive, or a specific metric. No vague filler sentences.
+
+   DO NOT follow a rigid fixed template every time — vary which of these you lead with and how many
+   you include based on what's actually in the data below. Draw from whatever mix applies:
+
+   - PRICE ACTION WITH A REASON: If price performance data is given, cite the specific move over
+     whichever timeframe is most notable (1-day, 5-day, 1-month, or YTD — pick the one that's
+     actually significant, don't list all four) AND tie it to a specific cause from the headline/news
+     if one is available. E.g. "Shares are up 4.6% over the past week after [specific reason from the
+     headline]." If you don't know the specific cause, you can still state the move itself, but do not
+     invent a cause.
+   - UPCOMING DATES: State exact known dates plainly — earnings date (and timing if known), a
+     dividend date (if given, check whether the data below marks it CONFIRMED or an ESTIMATE — state
+     confirmed dates as plain fact, but ALWAYS phrase estimated ones as an estimate, e.g. "next
+     dividend is estimated around..."), an SEC
+     filing date, or a Fed decision date.
+   - KEY HARD METRIC: If financial metrics are given (P/E, revenue growth, margins, dividend yield),
+     cite the SPECIFIC NUMBER for whichever one is most relevant to what's currently happening with
+     this holding, and briefly say why it matters in plain terms. E.g. "Gross margin sits at 42%,
+     worth watching since new product lines tend to launch at lower margins before scaling up."
+   - SEC FILING: If given, say plainly what type of filing it is and its specific date.
+   - HEADLINE ANGLE: If the recent headline mentions something forward-looking (a pending decision,
+     product launch, leadership change, legal matter, world/economic event), get SPECIFIC about it —
+     name the actual thing, not just "a recent development."
+   - FOR FUNDS/ETFs ONLY — holdings news: if headlines about the fund's top individual holdings are
+     given below, use them — this is usually the most useful, specific content you can give for a
+     fund, since "the market was mixed today" tells a reader nothing. E.g. "Within the fund's top
+     holdings, Nvidia is dealing with [specific headline detail], which matters here since it's one
+     of the fund's largest positions."
+   - THE "SO WHAT": At least one bullet should go a level deeper than just stating a fact — explain
+     briefly why it's worth watching or what tension/question it raises for this holding going
+     forward, in the way a knowledgeable friend would explain it, NOT as a prediction of where the
+     price will go. E.g. "Watch whether cloud revenue growth holds above 20% next quarter — that's
+     been the market's main yardstick for this stock lately." This is analysis of what to pay
+     attention to, not a forecast of the outcome.
+
+   Only include categories that actually have data — never write a bullet noting the ABSENCE of
+   something ("no earnings are scheduled," "no dividend data available"). Skip silently instead.
+
+CRITICAL — DO NOT HALLUCINATE NUMBERS:
+- Every specific number, percentage, date, or figure you state MUST come directly from the data
+  block below. Do NOT invent analyst estimates, consensus expectations, growth targets, or any
+  number that isn't explicitly provided to you.
+- If you want to describe an expectation or target (like "over 10% growth expected"), you may ONLY
+  do this if that specific expectation is explicitly present in the headline text or data below —
+  quote/paraphrase what's actually reported, don't estimate your own figure.
+- If you don't have a specific number for something, describe it qualitatively instead (e.g. "margin
+  trends" instead of inventing a margin percentage) rather than making one up.
+- Getting a number wrong is worse than being general — when in doubt, omit the specific figure.
+
+READABILITY — still written for everyday personal investors, not finance professionals:
+- Explain any jargon in plain words right where you use it (e.g. "gross margin — the share of
+  revenue left after production costs").
+- Write like a sharp, knowledgeable friend explaining what actually matters, not a press release or
+  a textbook.
+- Avoid unnecessary jargon that isn't a specific data point (e.g. don't say "market sentiment shifted"
+  — say what specifically happened).
+
+STRICT RULES — non-negotiable, for BOTH the headline and bullets:
 - Do NOT use the words "buy," "sell," "hold," or any variation telling the reader what to do.
 - Do NOT recommend, suggest, or imply any action the reader should take.
 - Do NOT say things like "good time to," "bad time to," "worth considering," or similar action-nudging phrases.
-- Do NOT predict future price direction ("will likely rise/fall") — stating a known upcoming date or
-  event (like an earnings date or FDA decision date) is fine; guessing what happens to the price
-  because of it is not.
-- Do not invent a catalyst, filing, or event that isn't actually in the data below — only surface
-  what's genuinely there.
+- Do NOT predict future price direction ("will likely rise/fall") — stating a known date/event, a
+  past price move, or a current metric is fine; guessing what happens to the price next is not. The
+  "so what" bullet should raise what to watch, never what will happen to the price.
+- Do not invent a catalyst, filing, event, or number that isn't actually in the data below.
 - Do not add a disclaimer sentence — one is added separately in the email template.
 
-Vary sentence openings and structure across different tickers so this doesn't read like a template
-repeated for every stock. Avoid starting with the word "Historically."
+Vary structure across different tickers so this doesn't read like a repeated template. Avoid starting
+with the word "Historically."
 
 Call the submit_blurb tool with your headline and bullets."""
 
@@ -523,13 +886,16 @@ def generate_blurb(snapshot, variation_index=0):
         )
     elif is_fund:
         asset_type_note = (
-            "This ticker is a broad-market index fund or ETF, not a single company — "
-            "it holds many underlying stocks. Do NOT reference 'earnings reports' or "
-            "talk about it as if it were one company. Instead, discuss it in terms of "
-            "overall market/sector movement."
+            "This ticker is a broad-market index fund or ETF, not a single company — it holds many "
+            "underlying stocks. Do NOT reference 'earnings reports' or talk about it as if it were one "
+            "company. If news on its top individual holdings is given below, lean on that heavily — "
+            "specific company-level news is far more useful to a reader than generic sector talk."
         )
     else:
-        asset_type_note = "This ticker is an individual company's stock."
+        asset_type_note = (
+            "This ticker is an individual company's stock. If key financial metrics are given below, use "
+            "the one most relevant to what's currently happening — don't just list all of them."
+        )
 
     style_hint = STYLE_HINTS[variation_index % len(STYLE_HINTS)]
 
@@ -553,12 +919,47 @@ def generate_blurb(snapshot, variation_index=0):
         f = snapshot["sec_filing"]
         filing_line = f"Recent SEC filing: form {f['form']} filed on {f['date']}."
 
+    perf_line = ""
+    perf = snapshot.get("price_performance") or {}
+    perf_parts = [f"1-day: {snapshot['pct_change']:+.1f}%"]
+    if "5d" in perf:
+        perf_parts.append(f"5-day: {perf['5d']:+.1f}%")
+    if "1m" in perf:
+        perf_parts.append(f"1-month: {perf['1m']:+.1f}%")
+    if "ytd" in perf:
+        perf_parts.append(f"YTD: {perf['ytd']:+.1f}%")
+    perf_line = f"Price performance — {', '.join(perf_parts)}."
+
+    metrics_line = ""
+    if snapshot.get("key_metrics"):
+        metrics_desc = "; ".join(f"{k}: {v}" for k, v in snapshot["key_metrics"].items())
+        metrics_line = f"Key financial metrics: {metrics_desc}."
+
+    dividend_line = ""
+    if snapshot.get("dividend_info"):
+        d = snapshot["dividend_info"]
+        if d.get("confirmed"):
+            dividend_line = f"Dividend: next ex-dividend date is confirmed for {d['date']} (this is a real, company-declared date — state it as fact)."
+        else:
+            dividend_line = (f"Dividend: last paid on {d['based_on']}; next payment is roughly estimated "
+                              f"around {d['date']} based on typical quarterly cadence (NOT a confirmed date — "
+                              f"you MUST phrase this as an estimate, e.g. 'roughly estimated around').")
+
+    holdings_line = ""
+    if snapshot.get("holdings_news"):
+        holdings_desc = " | ".join(f"{h['ticker']}: {h['headline']}" for h in snapshot["holdings_news"])
+        holdings_line = f"News on this fund's top individual holdings: {holdings_desc}"
+
     dynamic_data = f"""Ticker: {snapshot['ticker']}
 {asset_type_note}
 Recent headline: {snapshot['headline'] or 'No major headline today'}
+{perf_line}
 {earnings_line}
 {macro_line}
 {filing_line}
+{metrics_line}
+{dividend_line}
+{holdings_line}
 
 STYLE for this one: {style_hint}"""
 
@@ -570,7 +971,7 @@ STYLE for this one: {style_hint}"""
     try:
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=350,
+            max_tokens=550,
             tools=[{
                 "name": "submit_blurb",
                 "description": "Submit the generated headline and bullet points for this ticker.",
@@ -584,9 +985,9 @@ STYLE for this one: {style_hint}"""
                         "bullets": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "minItems": 1,
-                            "maxItems": 4,
-                            "description": "2-4 short, one-sentence bullet points following the priority order and rules above.",
+                            "minItems": 3,
+                            "maxItems": 5,
+                            "description": "3-5 specific, data-grounded bullets (1-2 sentences each) following the rules above.",
                         },
                     },
                     "required": ["headline", "bullets"],

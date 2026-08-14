@@ -511,16 +511,65 @@ def get_key_metrics(ticker):
             return None
 
         raw = {
-            "P/E (TTM)": pick("peTTM", "peBasicExclExtraTTM", "peExclExtraTTM"),
+            "P/E (trailing)": pick("peTTM", "peBasicExclExtraTTM", "peExclExtraTTM"),
+            "P/E (forward)": pick("peForward", "forwardPE", "peNormalizedAnnual"),
+            "PEG ratio": pick("pegRatio", "pegRatioTTM"),
+            "Price/Sales": pick("psTTM", "psAnnual", "priceToSalesTTM"),
             "Revenue growth YoY": pick("revenueGrowthTTMYoy", "revenueGrowthQuarterlyYoy"),
             "EPS growth YoY": pick("epsGrowthTTMYoy", "epsGrowthQuarterlyYoy"),
             "Gross margin": pick("grossMarginTTM", "grossMarginAnnual"),
             "Net margin": pick("netProfitMarginTTM", "netProfitMarginAnnual"),
+            "Debt/Equity": pick("totalDebt/totalEquityAnnual", "totalDebt/totalEquityQuarterly", "longTermDebt/equityAnnual"),
             "Dividend yield": pick("dividendYieldIndicatedAnnual", "currentDividendYieldTTM"),
         }
         return {k: v for k, v in raw.items() if v is not None}
     except Exception as e:
         print(f"Key metrics lookup failed for {ticker}: {e}")
+        return {}
+
+
+def get_peer_comparison(ticker):
+    """Real (not fabricated) peer/industry-average context for valuation
+    ratios. Uses Finnhub's free /stock/peers endpoint to get same-industry
+    tickers, then averages P/E and Price/Sales across up to 2 of them —
+    capped deliberately low since each peer costs a full extra metrics call,
+    and this already runs on top of a fairly heavy per-ticker call budget.
+    Returns {"peers": ["MSFT","GOOGL"], "avg_pe": 28.4, "avg_ps": 7.1} with
+    only the ratios that actually came back — never fabricated. Returns {}
+    if peers aren't available or none had usable data."""
+    try:
+        resp = requests.get(
+            "https://finnhub.io/api/v1/stock/peers",
+            params={"symbol": ticker, "token": FINNHUB_API_KEY},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        peers = [p for p in resp.json() if p and p.upper() != ticker.upper()][:2]
+        if not peers:
+            return {}
+
+        pes, pss, used = [], [], []
+        for p in peers:
+            m = get_key_metrics(p)
+            pe = m.get("P/E (trailing)")
+            ps = m.get("Price/Sales")
+            if pe is not None or ps is not None:
+                used.append(p)
+            if pe is not None:
+                pes.append(pe)
+            if ps is not None:
+                pss.append(ps)
+
+        if not used:
+            return {}
+        result = {"peers": used}
+        if pes:
+            result["avg_pe"] = round(sum(pes) / len(pes), 1)
+        if pss:
+            result["avg_ps"] = round(sum(pss) / len(pss), 1)
+        return result
+    except Exception as e:
+        print(f"Peer comparison lookup failed for {ticker}: {e}")
         return {}
 
 
@@ -690,6 +739,13 @@ LEVERAGED_FUND_UNDERLYING = {
     "UPRO": "SPY", "SPXL": "SPY", "SPXS": "SPY",
 }
 
+# Broader than the mapping above — includes leveraged funds with no clean
+# single-index underlying to redirect to (SOXL/SOXS track a semiconductor
+# index, TMF/TMV track long-duration treasuries). Used only to flag these in
+# the email as "(leveraged)" so readers don't mistake them for a plain index
+# fund — these carry daily-reset compounding risk a normal ETF doesn't.
+LEVERAGED_TICKERS = set(LEVERAGED_FUND_UNDERLYING.keys()) | {"SOXL", "SOXS", "TMF", "TMV"}
+
 
 def get_live_etf_holdings(ticker, top_n=3):
     """Real top holdings via yfinance's funds_data (reads Yahoo Finance's
@@ -839,6 +895,7 @@ def get_stock_snapshot(ticker, macro_events=None, max_retries=3):
                 "sec_filing": None if is_fund or is_crypto else get_sec_filings(ticker),
                 "price_performance": get_price_performance(ticker, current_price),
                 "key_metrics": {} if is_fund or is_crypto else get_key_metrics(ticker),
+                "peer_comparison": {} if is_fund or is_crypto else get_peer_comparison(ticker),
                 "dividend_info": None if is_crypto else get_dividend_info(ticker),
                 "holdings_news": get_holdings_news(ticker) if is_fund else [],
                 "fund_info": fund_info if is_fund else None,
@@ -884,10 +941,10 @@ KNOWN_FUNDS = {
 # Rotated through so consecutive blurbs don't all lean on the same opening
 # word/structure (e.g. everything starting with "Historically...").
 STYLE_HINTS = [
-    "Open with the upcoming date/event if there is one, then connect it to today's price move.",
-    "Open with the price move itself, then pivot straight to what's coming up next.",
-    "Open with the news/headline angle, then connect it to what's ahead.",
-    "Open by framing the size of today's move (small/moderate/large relative to typical daily swings), then get to what's next.",
+    "Open with the upcoming date/event if there is one, then build into the hypothesis.",
+    "Open with the valuation-vs-growth picture, then connect it to what's coming up.",
+    "Open with the news/headline angle, then connect it to the longer-term hypothesis.",
+    "Open directly with the hypothesis/question worth watching, then back it with the specifics.",
 ]
 
 # This block is IDENTICAL on every single call, regardless of ticker, asset
@@ -898,87 +955,115 @@ STYLE_HINTS = [
 # premium on the first call that writes the cache, but only ~10% of normal
 # input price on every subsequent call within the cache window (5 min) that
 # reuses it — a net win as soon as a run generates more than one blurb.
-STATIC_BLURB_INSTRUCTIONS = """You are writing content for an educational investing newsletter aimed at people who already own this holding and want SPECIFIC, useful information — not a generic description of what the company or fund is. Assume the reader already knows the basics; they want what's actually going on right now and what's coming up.
+STATIC_BLURB_INSTRUCTIONS = """You are writing content for an educational investing newsletter aimed at people who already own this holding FOR THE LONG TERM. Assume the reader already knows the basics; they want to understand what actually matters for this holding going forward — not a recap of what the price did yesterday.
 
 Produce TWO things:
 
 1. A short, catchy, punny/playful headline (max 8 words) tied to the specific news/data below (e.g.
    for a rocket company with a pending launch: "SpaceX Counts Down to Launch Day"). Must NOT imply
-   the reader should buy, sell, or take any action.
+   the reader should buy, sell, or take any action, and must NOT center on a daily price swing.
 
-2. A set of 3-5 bullet points. Bullets can be ONE or TWO sentences each (two is fine when you're
-   connecting a specific number to why it matters) — but every sentence must contain a concrete,
-   specific fact: a date, a percentage, a dollar figure, a named event, a named product, a named
-   executive, or a specific metric. No vague filler sentences.
+2. A set of 3-5 bullet points, built around ONE THROUGHLINE: a forward-looking investment hypothesis
+   — a specific thing worth watching over the coming weeks/quarters, and why. This is the single most
+   important thing about this newsletter: readers already get today's price everywhere else. What
+   they can't get elsewhere is "here's the specific thing that will tell you if the long-term story is
+   still intact." Every set of bullets should build toward that, in different ways for different
+   tickers so it doesn't read like a template. Bullets can be ONE or TWO sentences each — every
+   sentence must contain a concrete, specific fact: a date, a percentage, a dollar figure, a named
+   event, a named product, a named executive, or a specific metric. No vague filler.
 
-   DO NOT follow a rigid fixed template every time — vary which of these you lead with and how many
-   you include based on what's actually in the data below. Draw from whatever mix applies:
+   PRIORITIZE FUNDAMENTALS OVER DAILY NOISE. Rank what you draw from roughly in this order of
+   importance — fundamentals should dominate the bullets, short-term noise should be a light garnish
+   at most, never the lead:
 
-   - PRICE ACTION WITH A REASON: If price performance data is given, cite the specific move over
-     whichever timeframe is most notable (1-day, 5-day, 1-month, or YTD — pick the one that's
-     actually significant, don't list all four) AND tie it to a specific cause from the headline/news
-     if one is available. E.g. "Shares are up 4.6% over the past week after [specific reason from the
-     headline]." If you don't know the specific cause, you can still state the move itself, but do not
-     invent a cause.
-   - UPCOMING DATES: State exact known dates plainly — earnings date (and timing if known), a
-     dividend date (if given, check whether the data below marks it CONFIRMED or an ESTIMATE — state
-     confirmed dates as plain fact, but ALWAYS phrase estimated ones as an estimate, e.g. "next
-     dividend is estimated around..."), an SEC
-     filing date, or a Fed decision date.
-   - KEY HARD METRIC: If financial metrics are given (P/E, revenue growth, margins, dividend yield),
-     cite the SPECIFIC NUMBER for whichever one is most relevant to what's currently happening with
-     this holding, and briefly say why it matters in plain terms. E.g. "Gross margin sits at 42%,
-     worth watching since new product lines tend to launch at lower margins before scaling up."
-   - SEC FILING: If given, say plainly what type of filing it is and its specific date.
-   - HEADLINE ANGLE: If the recent headline mentions something forward-looking (a pending decision,
-     product launch, leadership change, legal matter, world/economic event), get SPECIFIC about it —
-     name the actual thing, not just "a recent development."
-   - FOR FUNDS/ETFs ONLY — holdings news: if headlines about the fund's top individual holdings are
-     given below, use them — this is usually the most useful, specific content you can give for a
-     fund, since "the market was mixed today" tells a reader nothing. E.g. "Within the fund's top
-     holdings, Nvidia is dealing with [specific headline detail], which matters here since it's one
-     of the fund's largest positions."
-   - THE "SO WHAT": At least one bullet should go a level deeper than just stating a fact — explain
-     briefly why it's worth watching or what tension/question it raises for this holding going
-     forward, in the way a knowledgeable friend would explain it, NOT as a prediction of where the
-     price will go. E.g. "Watch whether cloud revenue growth holds above 20% next quarter — that's
-     been the market's main yardstick for this stock lately." This is analysis of what to pay
-     attention to, not a forecast of the outcome.
+   TIER 1 — FUNDAMENTAL SIGNALS (this should be most of the content):
+   - Earnings date/timing, and what specifically to watch for at that report if the data suggests
+     something (e.g. a metric that's been trending a certain way).
+   - Valuation paired with growth — THIS PAIRING MATTERS: whenever you cite a growth number (revenue
+     growth, EPS growth), pair it with a valuation ratio given below (P/E, PEG, Price/Sales) so the
+     reader sees growth in context, not in isolation. E.g. "Revenue grew 12% YoY, and at a forward P/E
+     of 24 the stock isn't pricing in much more than that continuing." If peer/industry comparison
+     data is given, you can use it to add context (e.g. "...compared to peers averaging closer to
+     19x") — but don't force a peer comparison into every single bullet; use it when it's genuinely
+     the most useful framing, not as a rigid formula every time.
+   - Debt/balance-sheet changes, if given, and margin trends (gross/net) — tie to what it implies
+     going forward (e.g. rising debt/equity worth watching, or margin trend suggesting pricing power).
+   - SEC filings — say plainly what type and its date.
+   - Management guidance shifts — if the headline mentions a change in outlook, guidance, or strategy,
+     this is high-value; get specific about what changed.
+   - Dividend date — CONFIRMED dates stated as fact; ESTIMATED ones always hedged ("roughly estimated
+     around...").
+   - FOR FUNDS/ETFs — news on top individual holdings (given below) is your best fundamental content,
+     since "the market was mixed" tells a reader nothing. Use it like you would company news.
+
+   TIER 2 — MACRO/SENTIMENT CONTEXT (use briefly, as supporting color, not the main point):
+   - Fed decisions, CPI/inflation prints, short-term rate expectations, sector rotation. These are
+     legitimate to mention — especially for funds — but keep them in a supporting role. Do not let a
+     macro/sentiment bullet be the most prominent one, and do not frame short-term rate or sentiment
+     noise as more decision-relevant than the Tier 1 fundamentals above.
+
+   PRICE MOVEMENT — de-emphasize this deliberately:
+   - Do NOT lead with or headline a single day's price move — daily swings create noise/panic/excitement
+     that isn't useful for a long-term holder, and this newsletter is explicitly trying not to
+     encourage reacting to them.
+   - If you mention price performance at all, prefer the longer window (1-month or YTD) over the
+     1-day number, and only include it as brief supporting context for a fundamental point — never as
+     a standalone bullet about "the stock moved X% today."
+
+   THE HYPOTHESIS ITSELF — at least one bullet must explicitly frame something forward-looking to
+   watch, phrased as a question or a specific marker a long-term holder should track — NOT a
+   prediction of where the price goes. Vary the phrasing every time so it doesn't become a template
+   (do not write "watch whether X holds steady" as a formula on every ticker — find a different way
+   to say it each time). If an exact date is available for the event this hypothesis hangs on (the
+   earnings date given below, for example), USE THE EXACT DATE in this bullet too, not a vague
+   reference to it — e.g.: "The real test on August 14 is whether ad revenue growth can offset
+   slowing subscriber additions." / "Keep an eye on whether the next guidance update — expected
+   alongside the September 16 Fed decision's market reaction — narrows or widens that margin
+   outlook." If no exact date applies to this particular hypothesis, phrase it without inventing a
+   timeframe: "The open question here: can pricing power offset the input-cost pressure flagged in
+   the headline below" — not "next quarter" or "soon" when you don't actually have that date.
 
    Only include categories that actually have data — never write a bullet noting the ABSENCE of
-   something ("no earnings are scheduled," "no dividend data available"). Skip silently instead.
+   something. Skip silently instead.
+
+LEVERAGED FUNDS — if the data below flags this ticker as leveraged/inverse, you do not need to
+explain leverage mechanics (a small warning tag is already shown next to the ticker in the email) —
+but do NOT frame it with the same long-term "hold and watch fundamentals" lens as a plain index fund,
+since leveraged/inverse products are structurally built for short-term use and decay over time from
+daily rebalancing. A brief, neutral acknowledgment of that is fine; don't lecture.
 
 CRITICAL — DO NOT HALLUCINATE NUMBERS:
 - Every specific number, percentage, date, or figure you state MUST come directly from the data
-  block below. Do NOT invent analyst estimates, consensus expectations, growth targets, or any
-  number that isn't explicitly provided to you.
-- If you want to describe an expectation or target (like "over 10% growth expected"), you may ONLY
-  do this if that specific expectation is explicitly present in the headline text or data below —
-  quote/paraphrase what's actually reported, don't estimate your own figure.
-- If you don't have a specific number for something, describe it qualitatively instead (e.g. "margin
-  trends" instead of inventing a margin percentage) rather than making one up.
-- Getting a number wrong is worse than being general — when in doubt, omit the specific figure.
+  block below. Do NOT invent analyst estimates, consensus expectations, growth targets, industry
+  averages, or any number that isn't explicitly provided to you.
+- If you want to describe an expectation or target, you may ONLY do this if it's explicitly present
+  in the headline text or data below — quote/paraphrase what's reported, don't estimate your own figure.
+- If you don't have a specific number for something, describe it qualitatively instead rather than
+  making one up. Getting a number wrong is worse than being general — when in doubt, omit it.
 
 READABILITY — still written for everyday personal investors, not finance professionals:
-- Explain any jargon in plain words right where you use it (e.g. "gross margin — the share of
-  revenue left after production costs").
-- Write like a sharp, knowledgeable friend explaining what actually matters, not a press release or
-  a textbook.
-- Avoid unnecessary jargon that isn't a specific data point (e.g. don't say "market sentiment shifted"
-  — say what specifically happened).
+- Explain any jargon in plain words right where you use it (e.g. "PEG ratio — P/E divided by growth
+  rate, a way of checking whether a high P/E is justified by how fast the company is actually growing").
+- Write like a sharp, knowledgeable friend explaining what actually matters, not a press release.
 
 STRICT RULES — non-negotiable, for BOTH the headline and bullets:
 - Do NOT use the words "buy," "sell," "hold," or any variation telling the reader what to do.
 - Do NOT recommend, suggest, or imply any action the reader should take.
 - Do NOT say things like "good time to," "bad time to," "worth considering," or similar action-nudging phrases.
-- Do NOT predict future price direction ("will likely rise/fall") — stating a known date/event, a
-  past price move, or a current metric is fine; guessing what happens to the price next is not. The
-  "so what" bullet should raise what to watch, never what will happen to the price.
-- Do not invent a catalyst, filing, event, or number that isn't actually in the data below.
+- Do NOT predict future price direction ("will likely rise/fall") — a hypothesis bullet raises what
+  to watch, never what will happen to the price as a result.
+- Do not invent a catalyst, filing, event, ratio, or number that isn't actually in the data below.
 - Do not add a disclaimer sentence — one is added separately in the email template.
+- USE EXACT DATES, EVERY TIME, wherever one is available in the data below — never substitute vague
+  phrases like "next quarter," "next earnings call," "later this year," "this fall," or "soon" once
+  you already have the actual date. This applies everywhere in the bullets, not just the first time
+  an event is mentioned — if the hypothesis bullet references the same earnings report or Fed
+  decision as an earlier bullet, restate the exact date there too rather than referring back to it
+  vaguely. If NO exact date exists for something, don't invent a timeframe — phrase it without one.
 
-Vary structure across different tickers so this doesn't read like a repeated template. Avoid starting
-with the word "Historically."
+Vary structure and phrasing across different tickers so this doesn't read like a repeated template —
+this applies especially to the hypothesis bullet, which is the easiest place to fall into a formula.
+Avoid starting with the word "Historically."
 
 Call the submit_blurb tool with your headline and bullets."""
 
@@ -1058,19 +1143,33 @@ def generate_blurb(snapshot, variation_index=0):
 
     perf_line = ""
     perf = snapshot.get("price_performance") or {}
-    perf_parts = [f"1-day: {snapshot['pct_change']:+.1f}%"]
-    if "5d" in perf:
-        perf_parts.append(f"5-day: {perf['5d']:+.1f}%")
-    if "1m" in perf:
-        perf_parts.append(f"1-month: {perf['1m']:+.1f}%")
+    # 1-day is included last and de-emphasized in the label itself — the prompt
+    # is instructed to prefer the longer windows and avoid leading with this one.
+    perf_parts = []
     if "ytd" in perf:
         perf_parts.append(f"YTD: {perf['ytd']:+.1f}%")
+    if "1m" in perf:
+        perf_parts.append(f"1-month: {perf['1m']:+.1f}%")
+    if "5d" in perf:
+        perf_parts.append(f"5-day: {perf['5d']:+.1f}%")
+    perf_parts.append(f"1-day (de-emphasize this one, it's noise): {snapshot['pct_change']:+.1f}%")
     perf_line = f"Price performance — {', '.join(perf_parts)}."
 
     metrics_line = ""
     if snapshot.get("key_metrics"):
         metrics_desc = "; ".join(f"{k}: {v}" for k, v in snapshot["key_metrics"].items())
         metrics_line = f"Key financial metrics: {metrics_desc}."
+
+    peer_line = ""
+    peer = snapshot.get("peer_comparison") or {}
+    if peer.get("peers"):
+        peer_bits = []
+        if "avg_pe" in peer:
+            peer_bits.append(f"avg P/E {peer['avg_pe']}")
+        if "avg_ps" in peer:
+            peer_bits.append(f"avg Price/Sales {peer['avg_ps']}")
+        if peer_bits:
+            peer_line = f"Peer/industry comparison (based on {', '.join(peer['peers'])}): {', '.join(peer_bits)}."
 
     dividend_line = ""
     if snapshot.get("dividend_info"):
@@ -1087,14 +1186,22 @@ def generate_blurb(snapshot, variation_index=0):
         holdings_desc = " | ".join(f"{h['ticker']}: {h['headline']}" for h in snapshot["holdings_news"])
         holdings_line = f"News on this fund's top individual holdings: {holdings_desc}"
 
+    leveraged_line = ""
+    if snapshot['ticker'] in LEVERAGED_TICKERS:
+        leveraged_line = ("NOTE: this is a LEVERAGED/INVERSE fund — it resets and compounds daily and "
+                           "isn't structurally built for a 'watch these fundamentals long-term' framing "
+                           "the way a plain index fund is. Keep that in mind for the hypothesis bullet.")
+
     dynamic_data = f"""Ticker: {snapshot['ticker']}
 {asset_type_note}
+{leveraged_line}
 Recent headline: {snapshot['headline'] or 'No major headline today'}
 {perf_line}
 {earnings_line}
 {macro_line}
 {filing_line}
 {metrics_line}
+{peer_line}
 {dividend_line}
 {holdings_line}
 
@@ -1199,6 +1306,10 @@ def build_email_html(name, stock_sections, sponsor=None, referral_count=0, marke
         # Display-friendly ticker: strip exchange prefix for crypto (e.g.
         # "BINANCE:BTCUSDT" shows as "BTCUSDT") so it doesn't look technical.
         display_ticker = s['ticker'].split(":")[-1] if ":" in s['ticker'] else s['ticker']
+        leveraged_tag = (
+            ' <span style="color:#a13d2e; font-weight:bold;">(leveraged)</span>'
+            if s['ticker'] in LEVERAGED_TICKERS else ""
+        )
         bullets_html = "".join(
             f'<li style="font-family:Arial,sans-serif; font-size:14px; color:#333; line-height:1.6; margin-bottom:4px;">{b}</li>'
             for b in bullets
@@ -1209,7 +1320,7 @@ def build_email_html(name, stock_sections, sponsor=None, referral_count=0, marke
             <tr><td style="padding:16px;">
               <div style="font-family:Georgia,'Times New Roman',serif; font-size:17px; color:{NAVY_900}; margin-bottom:6px;">{headline}</div>
               <div style="font-family:Arial,sans-serif; font-size:13px; font-weight:bold; color:{MUTED}; margin-bottom:10px;">
-                {display_ticker} &nbsp;·&nbsp; ${s['price']}
+                {display_ticker}{leveraged_tag} &nbsp;·&nbsp; ${s['price']}
               </div>
               <ul style="margin:0; padding-left:18px;">{bullets_html}</ul>
             </td></tr>

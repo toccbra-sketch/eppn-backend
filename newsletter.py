@@ -1290,11 +1290,12 @@ STYLE for this one: {style_hint}"""
 def build_email_html(name, stock_sections, sponsor=None, referral_count=0, market_overview=None):
     # Colors matched to eppn-common.css so the email looks like an extension
     # of the site rather than a separate, older-looking product.
-    NAVY_900 = "#0a1930"
-    NAVY_700 = "#17365f"
-    MUTED = "#667085"
-    BORDER = "#dcdfe4"
-    PAPER = "#f6f5f1"
+    NAVY_900 = "#14213D"
+    NAVY_700 = "#2C4570"
+    BRASS = "#B08D57"
+    MUTED = "#6B7280"
+    BORDER = "#E4E0D8"
+    PAPER = "#F7F7F5"
 
     SITE_BASE = "https://theportfoliobriefcase.com"
     BACKEND_BASE = "https://eppn-backend.onrender.com"
@@ -1307,7 +1308,9 @@ def build_email_html(name, stock_sections, sponsor=None, referral_count=0, marke
         # "BINANCE:BTCUSDT" shows as "BTCUSDT") so it doesn't look technical.
         display_ticker = s['ticker'].split(":")[-1] if ":" in s['ticker'] else s['ticker']
         leveraged_tag = (
-            ' <span style="color:#a13d2e; font-weight:bold;">(leveraged)</span>'
+            '<span style="font-family:Arial,sans-serif; font-size:10px; letter-spacing:0.4px; '
+            'text-transform:uppercase; color:#8A8577; border:1px solid #D9D2C4; border-radius:3px; '
+            'padding:2px 6px; margin-left:8px;">Leveraged</span>'
             if s['ticker'] in LEVERAGED_TICKERS else ""
         )
         bullets_html = "".join(
@@ -1315,14 +1318,19 @@ def build_email_html(name, stock_sections, sponsor=None, referral_count=0, marke
             for b in bullets
         )
         sections_html += f"""
-        <tr><td style="padding:0 0 12px;">
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {BORDER}; border-radius:6px; background:#ffffff;">
-            <tr><td style="padding:16px;">
-              <div style="font-family:Georgia,'Times New Roman',serif; font-size:17px; color:{NAVY_900}; margin-bottom:6px;">{headline}</div>
-              <div style="font-family:Arial,sans-serif; font-size:13px; font-weight:bold; color:{MUTED}; margin-bottom:10px;">
-                {display_ticker}{leveraged_tag} &nbsp;·&nbsp; ${s['price']}
+        <tr><td style="padding:0 0 14px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+            <tr><td style="border-left:4px solid {NAVY_700}; padding:0 0 0 14px;">
+              <div style="display:inline-block; background:{BRASS}; color:{NAVY_900}; font-family:Arial,sans-serif; font-size:11px; font-weight:bold; letter-spacing:0.5px; padding:3px 8px; border-radius:3px 3px 0 0;">{display_ticker}</div>
+              <div style="background:{PAPER}; border-radius:0 4px 4px 4px; padding:16px;">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:4px;"><tr>
+                  <td style="font-family:Georgia,'Times New Roman',serif; font-size:17px; color:{NAVY_900};">{headline}</td>
+                </tr></table>
+                <div style="font-family:Arial,sans-serif; font-size:13px; font-weight:bold; color:{NAVY_700}; margin-bottom:10px;">
+                  ${s['price']}{leveraged_tag}
+                </div>
+                <ul style="margin:0; padding-left:18px;">{bullets_html}</ul>
               </div>
-              <ul style="margin:0; padding-left:18px;">{bullets_html}</ul>
             </td></tr>
           </table>
         </td></tr>
@@ -1366,9 +1374,9 @@ def build_email_html(name, stock_sections, sponsor=None, referral_count=0, marke
         <table role="presentation" cellpadding="0" cellspacing="0"><tr>
           <td style="padding-right:9px; vertical-align:middle;">
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <rect x="2.5" y="8" width="19" height="12.5" rx="1.8" stroke="#ffffff" stroke-width="1.6"/>
-              <path d="M8.5 8V6.3C8.5 5.1 9.5 4 10.8 4H13.2C14.5 4 15.5 5.1 15.5 6.3V8" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round"/>
-              <rect x="10.3" y="12.5" width="3.4" height="2.4" rx="0.5" fill="#ffffff"/>
+              <rect x="2.5" y="8" width="19" height="12.5" rx="1.8" stroke="#B08D57" stroke-width="1.6"/>
+              <path d="M8.5 8V6.3C8.5 5.1 9.5 4 10.8 4H13.2C14.5 4 15.5 5.1 15.5 6.3V8" stroke="#B08D57" stroke-width="1.6" stroke-linecap="round"/>
+              <rect x="10.3" y="12.5" width="3.4" height="2.4" rx="0.5" fill="#B08D57"/>
             </svg>
           </td>
           <td style="font-family:Georgia,'Times New Roman',serif; font-size:19px; color:#ffffff; vertical-align:middle;">
@@ -1379,6 +1387,10 @@ def build_email_html(name, stock_sections, sponsor=None, referral_count=0, marke
 
       <!-- Body -->
       <tr><td style="padding:22px 20px;">
+        <div style="font-family:Arial,sans-serif; font-size:15px; color:#333; margin-bottom:18px;">
+          Hi {name}, here's what's happening with your portfolio today.
+        </div>
+
         <div style="font-family:Georgia,'Times New Roman',serif; font-size:20px; color:{NAVY_900}; margin-bottom:2px;">
           Your daily portfolio update
         </div>
@@ -1388,10 +1400,6 @@ def build_email_html(name, stock_sections, sponsor=None, referral_count=0, marke
 
         {overview_html}
 
-        <div style="font-family:Arial,sans-serif; font-size:14px; color:#333; margin-bottom:16px;">
-          Hi {name}, here's what's happening with your stocks today.
-        </div>
-
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:18px;">
           <tr><td style="background:{NAVY_900}; border-radius:6px; padding:14px 16px;">
             <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
@@ -1400,7 +1408,7 @@ def build_email_html(name, stock_sections, sponsor=None, referral_count=0, marke
                 <div style="font-family:Georgia,'Times New Roman',serif; font-size:22px; color:#ffffff;">{referral_count}</div>
               </td>
               <td style="text-align:right; vertical-align:middle;">
-                <a href="{SITE_BASE}/referrals.html" style="display:inline-block; background:#ffffff; color:{NAVY_900}; font-family:Arial,sans-serif; font-size:13px; font-weight:bold; text-decoration:none; padding:9px 16px; border-radius:4px;">
+                <a href="{SITE_BASE}/referrals.html" style="display:inline-block; background:{BRASS}; color:{NAVY_900}; font-family:Arial,sans-serif; font-size:13px; font-weight:bold; text-decoration:none; padding:9px 16px; border-radius:4px;">
                   Share your link
                 </a>
               </td>

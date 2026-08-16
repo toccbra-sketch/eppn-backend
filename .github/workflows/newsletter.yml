@@ -1,24 +1,34 @@
 name: Send Daily Newsletter
 
 on:
-  schedule:
-    # Runs at 5:05 AM Eastern, Monday through Friday, targeting an ~8am actual
-    # delivery given the ~3hr average delay we've observed from GitHub Actions'
-    # scheduler. This is a stopgap, not a real fix — the delay isn't a fixed
-    # offset and will vary day to day. If consistent delivery timing matters,
-    # the actual reliable fix is triggering this workflow from an external
-    # scheduler (e.g. cron-job.org hitting the workflow_dispatch REST API)
-    # instead of relying on GitHub's own `schedule:` trigger at all.
-    #
-    # Still offset a few minutes past the hour — GitHub's docs flag the top
-    # of the hour as the highest-congestion window for scheduled runs.
-    #
-    # Actual US market holidays (Thanksgiving, Christmas, etc.) are still
-    # filtered out inside newsletter.py itself, since cron has no concept of
-    # holidays.
-    - cron: '5 5 * * 1-5'
-      timezone: 'America/New_York'
-  workflow_dispatch: {}  # lets you manually trigger a run from the GitHub Actions tab, for testing
+  # PAUSED — schedule trigger commented out while doing an Instagram push and
+  # not wanting automatic sends firing in the background. Uncomment the
+  # `schedule:` block below (and remove this comment) to resume automatic
+  # daily sends.
+  #
+  # schedule:
+  #   # Runs at 5:05 AM Eastern, Monday through Friday, targeting an ~8am actual
+  #   # delivery given the ~3hr average delay we've observed from GitHub Actions'
+  #   # scheduler. This is a stopgap, not a real fix — the delay isn't a fixed
+  #   # offset and will vary day to day. If consistent delivery timing matters,
+  #   # the actual reliable fix is triggering this workflow from an external
+  #   # scheduler (e.g. cron-job.org hitting the workflow_dispatch REST API)
+  #   # instead of relying on GitHub's own `schedule:` trigger at all.
+  #   #
+  #   # Still offset a few minutes past the hour — GitHub's docs flag the top
+  #   # of the hour as the highest-congestion window for scheduled runs.
+  #   #
+  #   # Actual US market holidays (Thanksgiving, Christmas, etc.) are still
+  #   # filtered out inside newsletter.py itself, since cron has no concept of
+  #   # holidays.
+  #   - cron: '5 5 * * 1-5'
+  #     timezone: 'America/New_York'
+  workflow_dispatch:  # lets you manually trigger a run from the GitHub Actions tab
+    inputs:
+      test_email:
+        description: 'Send only to this email (leave blank to send to all real subscribers!)'
+        required: false
+        default: ''
 
 jobs:
   send-newsletter:
@@ -44,4 +54,5 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
           EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          TEST_EMAIL: ${{ inputs.test_email }}
         run: python newsletter.py
